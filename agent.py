@@ -3,6 +3,8 @@ import subprocess
 import json
 import ollama
 import re
+from pathlib import Path
+from threading import Lock
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -11,18 +13,37 @@ from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
-from datetime import datetime   # <-- NEU
+from datetime import datetime
 
 load_dotenv()
 
-# --- Logging-Hilfsfunktion ---
-LOG_FILE = "/opt/efro-agent/agent.log"
+# --- Logging / Runtime / Status ---
+BASE_DIR = Path(os.getenv("EFRO_AGENT_BASE_DIR", "/opt/efro-agent"))
+LOG_FILE = str(BASE_DIR / "agent.log")
+HOST = os.getenv("EFRO_AGENT_HOST", "0.0.0.0")
+PORT = int(os.getenv("EFRO_AGENT_PORT", "8000"))
+LOG_TAIL_LINES = int(os.getenv("EFRO_AGENT_LOG_TAIL_LINES", "400"))
+LOG_LOCK = Lock()
+STATUS_STATE: Dict[str, Any] = {
+    "state": "idle",
+    "detail": "Bereit",
+    "last_error": None,
+    "last_chat_at": None,
+    "last_tool_at": None,
+}
+
+def set_status(state: str, detail: str, error: Optional[str] = None):
+    STATUS_STATE["state"] = state
+    STATUS_STATE["detail"] = detail
+    STATUS_STATE["last_error"] = error
+
 
 def log_message(msg: str):
     try:
-        os.makedirs("/opt/efro-agent", exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+        os.makedirs(BASE_DIR, exist_ok=True)
+        with LOG_LOCK:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat()}] {msg}\n")
     except Exception as e:
         print("Logging Fehler:", e)
 
@@ -137,6 +158,22 @@ def parse_direct_command(message: str):
     text = message.strip().lower()
     if text in ("status", "agent status"):
         return ("status", None)
+
+    patterns = [
+        (r"^(?:linter|lint)\s+(efro|brain|widget|shopify)$", "linter"),
+        (r"^build\s+(efro|brain|widget|shopify)$", "build"),
+        (r"^test\s+(efro|brain|widget|shopify)$", "test"),
+        (r"^install\s+(efro|brain|widget|shopify)$", "install"),
+        (r"^optimize\s+(efro|brain|widget|shopify)$", "optimize"),
+        (r"^smoke\s+shopify$", "smoke_shopify"),
+    ]
+
+    for pattern, command in patterns:
+        match = re.match(pattern, text)
+        if match:
+            repo = match.group(1) if match.groups() else None
+            return (command, repo)
+
     return None
 
 
@@ -256,37 +293,13 @@ def update_elevenlabs_agent(agent_id: str, api_key: str, config: dict):
    
  
 # --- Agent-Kern mit Tool-Unterstützung ---
-class EfroAgent:
-    def __init__(self):
-        self.memory = []
-
-        # EFRO MASTER PROMPT LADEN
-        try:
-            with open("/opt/efro-agent/EFRO_MASTER_PROMPT.txt", "r", encoding="utf-8") as f:
-                self.system_prompt = f.read()
-        except Exception:
-            self.system_prompt = "EFRO MASTER PROMPT NICHT GEFUNDEN"
-
-    def query(self, user_input, extra_context=None):
-        # Chroma vorerst deaktiviert für Speed
-        context = "Kein Kontext (Chroma deaktiviert für Speed)."
-        extra = f"\nZusätzlicher Kontext (Tool-Ergebnisse):\n{extra_context}\n" if extra_context else ""
-
-        prompt = f"""
-{self.system_prompt}
-
-
-
+RUNTIME_RULES = """
 REGELN FÜR WAHRHEIT:
-
 - Du darfst keine Zusammenfassungen geben, ohne vorher Tools benutzt zu haben.
 - Jede technische Aussage muss auf einem Tool-Ergebnis basieren.
-- Wenn kein Tool genutzt wurde → darfst du KEINE finale Bewertung geben.
-- Wenn du unsicher bist → sag explizit "nicht verifiziert".
-- Bevor du optimierst:
-  1. prüfe mit Tools
-  2. analysiere Output
-  3. entscheide dann
+- Wenn kein Tool genutzt wurde, darfst du keine finale Bewertung geben.
+- Wenn du unsicher bist, sage explizit: nicht verifiziert.
+- Bevor du optimierst: 1. prüfen, 2. Output analysieren, 3. dann entscheiden.
 
 VERBOTEN:
 - erfundene Technologien
@@ -295,14 +308,10 @@ VERBOTEN:
 - erfundene Prozentzahlen
 
 WICHTIG:
-- Erfinde niemals Technologien, Dateien, Tests, Datenbanken oder Ergebnisse.
-- Behaupte nur etwas, wenn es durch echten Code, echte Logs oder echte Tool-Ergebnisse belegt ist.
-- Wenn du etwas nicht geprüft hast, sage klar: "nicht verifiziert".
+- Behaupte nur etwas, wenn echter Code, echte Logs oder echte Tool-Ergebnisse es belegen.
 - Wenn ein Tool sinnvoll ist, benutze es zuerst.
-- Gib keine erfundenen Prozentwerte für Tests oder Deployment-Status an.
 - Antworte faktenbasiert, nicht fantasiebasiert.
-- Wenn du optimierst, beschreibe nur reale Schritte, die du tatsächlich geprüft oder ausgeführt hast.
-
+- Beschreibe bei Optimierungen nur reale Schritte.
 
 TOOLS DIE DU NUTZEN KANNST:
 - linter <repo>
@@ -316,12 +325,43 @@ TOOLS DIE DU NUTZEN KANNST:
 - elevenlabs_agent <agent_id>
 
 WENN DU EIN TOOL VERWENDEN WILLST, NUTZE EXAKT DIESES FORMAT:
-
 ```tool
 tool_name
 param1
 param2
 ```
+""".strip()
+
+
+class EfroAgent:
+    def __init__(self):
+        self.memory = []
+        self.master_prompt_path = BASE_DIR / "EFRO_MASTER_PROMPT.txt"
+        self.master_prompt = self._load_master_prompt()
+
+    def _load_master_prompt(self) -> str:
+        try:
+            return self.master_prompt_path.read_text(encoding="utf-8")
+        except Exception:
+            return "EFRO MASTER PROMPT NICHT GEFUNDEN"
+
+    def build_runtime_prompt(self, user_input: str, extra_context=None) -> str:
+        context = "Kein Kontext (Chroma deaktiviert für Speed)."
+        extra_chunks = []
+        if extra_context:
+            if isinstance(extra_context, list):
+                for item in extra_context:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        extra_chunks.append(f"{item[0]}:\n{item[1]}")
+                    else:
+                        extra_chunks.append(str(item))
+            else:
+                extra_chunks.append(str(extra_context))
+        extra = f"\nZusätzlicher Kontext (Tool-Ergebnisse):\n" + "\n\n".join(extra_chunks) + "\n" if extra_chunks else ""
+        return f"""
+{self.master_prompt}
+
+{RUNTIME_RULES}
 
 SYSTEM-ZUSTAND:
 - Ziel: EFRO Projekt stabil + deployfähig + fehlerfrei
@@ -337,14 +377,11 @@ VERLAUF:
 USER:
 {user_input}
 
-WICHTIG:
-- Wenn ein Tool sinnvoll ist, benutze es direkt
-- Wenn mehrere Schritte nötig sind, führe sie logisch aus
-- Denke wie ein Senior Engineer / CTO
-
 ANTWORT:
-"""
+""".strip()
 
+    def query(self, user_input, extra_context=None):
+        prompt = self.build_runtime_prompt(user_input, extra_context=extra_context)
         response = ollama.chat(
             model="qwen2.5-coder:7b",
             messages=[{"role": "user", "content": prompt}]
@@ -360,11 +397,32 @@ ANTWORT:
 
 
 agent = EfroAgent()
+HANDOFFS: Dict[str, Dict[str, Any]] = {}
+
+
+def build_handoff_context(handoff: Dict[str, Any]) -> str:
+    source = handoff.get("source", "unbekannt")
+    summary = handoff.get("summary", "")
+    payload = handoff.get("payload") or {}
+    return (
+        f"HANDOFF\n"
+        f"- id: {handoff.get('id')}\n"
+        f"- source: {source}\n"
+        f"- summary: {summary}\n"
+        f"- payload: {json.dumps(payload, ensure_ascii=False)}"
+    )
+
 
 # --- API-Endpunkte für direkte Tool-Aufrufe ---
 class ToolRequest(BaseModel):
     tool: str
     params: list[str]
+
+
+class HandoffRequest(BaseModel):
+    source: str = "manual"
+    summary: str
+    payload: Optional[Dict[str, Any]] = None
 
 @app.post("/tool")
 async def call_tool(req: ToolRequest):
@@ -436,13 +494,52 @@ async def call_tool(req: ToolRequest):
     else:
         return {"error": f"Unbekanntes Tool: {req.tool}"}
 
+@app.get("/handoffs")
+async def list_handoffs():
+    return {"handoffs": list(HANDOFFS.values())}
+
+
+@app.get("/handoff/{handoff_id}")
+async def get_handoff(handoff_id: str):
+    handoff = HANDOFFS.get(handoff_id)
+    if not handoff:
+        raise HTTPException(status_code=404, detail="Handoff nicht gefunden")
+    return handoff
+
+
+@app.post("/handoff")
+async def create_handoff(req: HandoffRequest):
+    handoff_id = f"handoff-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    handoff = {
+        "id": handoff_id,
+        "source": req.source,
+        "summary": req.summary,
+        "payload": req.payload or {},
+        "created_at": datetime.now().isoformat(),
+    }
+    HANDOFFS[handoff_id] = handoff
+    log_message(f"HANDOFF created id={handoff_id} source={req.source}")
+    return handoff
+
+
 # --- Chat-Endpunkt ---
 class ChatRequest(BaseModel):
     message: str
+    handoff_id: Optional[str] = None
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_input = req.message.strip()
+    STATUS_STATE["last_chat_at"] = datetime.now().isoformat()
+    set_status("busy", "Chat-Anfrage wird verarbeitet")
+
+    extra_context_blocks = []
+    if req.handoff_id:
+        handoff = HANDOFFS.get(req.handoff_id)
+        if not handoff:
+            set_status("error", "Handoff nicht gefunden", error="handoff_not_found")
+            raise HTTPException(status_code=404, detail="Handoff nicht gefunden")
+        extra_context_blocks.append(build_handoff_context(handoff))
 
     # -------- DIRECT COMMAND MODE (SCHNELL + VERTRAUENSWÜRDIG) --------
     direct = parse_direct_command(user_input)
@@ -450,8 +547,9 @@ async def chat(req: ChatRequest):
         command, repo = direct
 
         if command == "status":
+            set_status("idle", "Bereit")
             return {
-                "reply": "Agent läuft. Direkte Befehle: linter <repo>, build <repo>, test <repo>, install <repo>, optimize <repo>",
+                "reply": f"Agent läuft. Status: {STATUS_STATE['detail']}. Host/Port: {HOST}:{PORT}. Verfügbare Direktbefehle: linter <repo>, build <repo>, test <repo>, install <repo>, optimize <repo>, smoke shopify. Health: /health",
                 "tool_results": []
             }
 
@@ -544,13 +642,14 @@ async def chat(req: ChatRequest):
     conversation_history = []
 
     for _ in range(max_tool_calls):
-        reply = agent.query(current_input, extra_context=conversation_history)
+        reply = agent.query(current_input, extra_context=extra_context_blocks + conversation_history)
         conversation_history.append(("assistant", reply))
 
         tool_pattern = r"```tool\s*(.*?)```"
         matches = re.findall(tool_pattern, reply, re.DOTALL)
 
         if not matches:
+            set_status("idle", "Bereit")
             return {"reply": reply, "tool_results": []}
 
         tool_results = []
@@ -565,6 +664,8 @@ async def chat(req: ChatRequest):
             tool_resp = await call_tool(tool_req)
 
             output = tool_resp.get("output", tool_resp.get("error", ""))
+            STATUS_STATE["last_tool_at"] = datetime.now().isoformat()
+            set_status("busy", f"Tool läuft: {tool_name}")
             tool_results.append({
                 "tool": tool_name,
                 "params": params,
@@ -695,113 +796,247 @@ Antwort nur als ```file Blöcke.
     await run_step("build", run_build, build_prompt)
     await run_step("test", run_tests, test_prompt)
 
-    
+    return results
 
-
-
-## 5. **Fehlerbehandlung in den API-Request-Funktionen**  
-##Problem: Bei Netzwerkfehlern könnten Exceptions auftreten.  
-##Lösung: Ersetze die Funktionen `vercel_request` und `render_request` durch robuste Versionen mit `try/except`.
-
-### Einfügen: Ersetze die beiden Funktionen.
-
-#python
-def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
-    import requests
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "service": "efro-agent",
+        "state": STATUS_STATE["state"],
+        "detail": STATUS_STATE["detail"],
+        "last_error": STATUS_STATE["last_error"],
+        "host": HOST,
+        "port": PORT,
+        "log_file": LOG_FILE,
+        "prompt_path": str(BASE_DIR / "EFRO_MASTER_PROMPT.txt"),
     }
-    url = f"https://api.vercel.com/{endpoint}"
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            resp = requests.post(url, headers=headers, json=data, timeout=30)
-        else:
-            return "Unsupported method"
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.RequestException as e:
-        return f"Fehler bei Vercel-API: {e}"
-def render_request(endpoint: str, api_token: str, method="GET", data=None):
-    import requests
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    url = f"https://api.render.com/{endpoint}"
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            resp = requests.post(url, headers=headers, json=data, timeout=30)
-        else:
-            return "Unsupported method"
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.RequestException as e:
-        return f"Fehler bei Render-API: {e}"        
 
-    
+
 @app.get("/log")
-async def get_log():
+async def get_log(limit: int = LOG_TAIL_LINES):
     try:
-        with open(LOG_FILE, "r") as f:
-            lines = f.readlines()[-100:]  # letzte 100 Zeilen
-        return {"log": "".join(lines)}
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            all_lines = [line.rstrip("\n") for line in f.readlines()]
+        if limit <= 0:
+            limit = LOG_TAIL_LINES
+        tail = all_lines[-limit:]
+        return {"lines": tail, "total_lines": len(all_lines)}
     except Exception as e:
-        return {"log": f"Log file not readable: {e}"}
+        return {"lines": [f"Log file not readable: {e}"], "total_lines": 0}
+
 
 @app.get("/")
 async def root():
     html = '''<!DOCTYPE html>
-<html>
+<html lang="de">
 <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Efro Agent</title>
     <style>
-        body { font-family: sans-serif; display: flex; margin: 0; }
-        #chat { width: 60%; border-right: 1px solid #ccc; padding: 10px; display: flex; flex-direction: column; height: 100vh; }
-        #terminal { width: 40%; padding: 10px; background: #1e1e1e; color: #d4d4d4; font-family: monospace; overflow-y: auto; height: 100vh; }
-        #messages { flex: 1; overflow-y: auto; border-bottom: 1px solid #ccc; margin-bottom: 10px; }
-        .message { margin: 8px; padding: 6px; border-radius: 8px; max-width: 90%; word-wrap: break-word; }
-        .user { background: #007acc; color: white; align-self: flex-end; }
-        .assistant { background: #f1f1f1; color: black; align-self: flex-start; }
-        .tool { background: #2ecc71; color: white; align-self: flex-start; font-family: monospace; }
-        .system { background: #f39c12; color: white; align-self: flex-start; font-family: monospace; }
-        #status { background: #34495e; color: white; padding: 5px; margin-bottom: 10px; border-radius: 4px; font-size: 12px; text-align: center; }
-        #input-area { display: flex; }
-        #message-input { flex: 1; padding: 8px; }
-        button { padding: 8px; }
-        .command-output { background: #2d2d2d; color: #ccc; padding: 5px; margin-top: 5px; font-family: monospace; white-space: pre-wrap; }
+        :root {
+            color-scheme: dark;
+            --bg: #0b1020;
+            --panel: #11182d;
+            --panel-soft: #18213b;
+            --border: #2a3558;
+            --text: #e8ecf8;
+            --muted: #a6b0cf;
+            --accent: #6ea8fe;
+            --good: #41d392;
+            --warn: #ffcb6b;
+            --bad: #ff7a90;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+        .shell {
+            display: grid;
+            grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.95fr);
+            gap: 16px;
+            min-height: 100vh;
+            padding: 16px;
+        }
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.22);
+            overflow: hidden;
+        }
+        .panel-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(255,255,255,0.02);
+        }
+        .title { font-size: 18px; font-weight: 700; }
+        .muted { color: var(--muted); font-size: 12px; }
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--panel-soft);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-size: 12px;
+        }
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: var(--good);
+        }
+        .layout-col {
+            display: flex;
+            flex-direction: column;
+            min-height: calc(100vh - 32px);
+        }
+        .chat-body {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            height: calc(100vh - 120px);
+        }
+        #messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .message {
+            max-width: 90%;
+            border-radius: 14px;
+            padding: 10px 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.45;
+        }
+        .user { align-self: flex-end; background: var(--accent); color: #081225; }
+        .assistant { align-self: flex-start; background: #eef3ff; color: #11182d; }
+        .tool { align-self: flex-start; background: #173327; color: #dff8ec; border: 1px solid #25533e; }
+        .system { align-self: flex-start; background: #3a2a10; color: #ffe2a7; border: 1px solid #6a4f1d; }
+        .composer {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            padding: 16px;
+            border-top: 1px solid var(--border);
+        }
+        input, select, button {
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--panel-soft);
+            color: var(--text);
+            padding: 10px 12px;
+            font: inherit;
+        }
+        button { cursor: pointer; }
+        button:hover { filter: brightness(1.08); }
+        .terminal-wrap {
+            display: flex;
+            flex-direction: column;
+            min-height: calc(100vh - 32px);
+        }
+        .terminal-tools {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        .terminal {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 16px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            background: #0a0f1d;
+        }
+        .terminal-line {
+            white-space: pre-wrap;
+            margin: 0 0 6px 0;
+            color: #d8def2;
+        }
+        .terminal-meta {
+            color: var(--muted);
+            font-size: 12px;
+            padding: 0 16px 12px;
+        }
+        .control-row {
+            display: grid;
+            grid-template-columns: 1fr 150px auto;
+            gap: 8px;
+            padding: 12px 16px 16px;
+            border-top: 1px solid var(--border);
+        }
+        .toggle-on { border-color: var(--accent); }
+        @media (max-width: 1100px) {
+            .shell { grid-template-columns: 1fr; }
+            .chat-body, .terminal-wrap { min-height: unset; height: auto; }
+            .terminal { min-height: 320px; }
+        }
     </style>
 </head>
 <body>
-<div id="chat">
-    <h3>Efro Agent – Chat</h3>
-    <div id="status">Bereit</div>
-    <div id="messages"></div>
-    <div id="input-area">
-        <input type="text" id="message-input" placeholder="Nachricht...">
-        <button id="send-btn">Senden</button>
-    </div>
-</div>
-<div id="terminal">
-    <h3>Terminal</h3>
-    <div id="terminal-output"></div>
-    <div style="margin-top: 10px;">
-        <input type="text" id="cmd-input" placeholder="Befehl...">
-        <button id="run-cmd">Ausführen</button>
-        <select id="repo-select">
-            <option value="efro">efro (Landing Page)</option>
-            <option value="brain">Brain API</option>
-            <option value="widget">Widget (Avatar)</option>
-            <option value="shopify">Shopify App</option>
-        </select>
-    </div>
-</div>
+<div class="shell">
+    <section class="panel layout-col">
+        <div class="panel-head">
+            <div>
+                <div class="title">Efro Agent</div>
+                <div class="muted">Chat, Tool-Ausgaben und ehrlicher Laufzeitstatus</div>
+            </div>
+            <div class="status-pill"><span class="dot" id="status-dot"></span><span id="status">Bereit</span></div>
+        </div>
+        <div class="chat-body">
+            <div id="messages"></div>
+            <div class="composer">
+                <input type="text" id="message-input" placeholder="Nachricht an den Agenten...">
+                <button id="send-btn">Senden</button>
+            </div>
+        </div>
+    </section>
 
-
+    <aside class="panel terminal-wrap">
+        <div class="panel-head">
+            <div>
+                <div class="title">Terminal & Logs</div>
+                <div class="muted">Inkrementelles Polling, keine chaotische Voll-Neuzeichnung</div>
+            </div>
+            <div class="status-pill"><span id="log-state">Polling aktiv</span></div>
+        </div>
+        <div class="terminal-tools">
+            <button id="clear-terminal">Clear Terminal</button>
+            <button id="pause-logs">Pause Logs</button>
+            <button id="autoscroll-toggle" class="toggle-on">Autoscroll</button>
+        </div>
+        <div id="terminal-output" class="terminal"></div>
+        <div class="terminal-meta" id="terminal-meta">Noch keine Logs geladen.</div>
+        <div class="control-row">
+            <input type="text" id="cmd-input" placeholder="Befehl...">
+            <select id="repo-select">
+                <option value="efro">efro</option>
+                <option value="brain">brain</option>
+                <option value="widget">widget</option>
+                <option value="shopify">shopify</option>
+            </select>
+            <button id="run-cmd">Ausführen</button>
+        </div>
+    </aside>
+</div>
 <script>
 document.addEventListener('DOMContentLoaded', () => {
     const messagesDiv = document.getElementById('messages');
@@ -812,6 +1047,22 @@ document.addEventListener('DOMContentLoaded', () => {
     const runCmdBtn = document.getElementById('run-cmd');
     const repoSelect = document.getElementById('repo-select');
     const statusDiv = document.getElementById('status');
+    const statusDot = document.getElementById('status-dot');
+    const logState = document.getElementById('log-state');
+    const terminalMeta = document.getElementById('terminal-meta');
+    const clearTerminalBtn = document.getElementById('clear-terminal');
+    const pauseLogsBtn = document.getElementById('pause-logs');
+    const autoscrollBtn = document.getElementById('autoscroll-toggle');
+
+    let logsPaused = false;
+    let autoScroll = true;
+    let knownTotalLines = 0;
+    let clearBaseline = 0;
+
+    function setStatus(text, kind = 'ready') {
+        statusDiv.innerText = text;
+        statusDot.style.background = kind === 'error' ? 'var(--bad)' : kind === 'busy' ? 'var(--warn)' : 'var(--good)';
+    }
 
     function addMessage(role, text, extraClass = '') {
         const msgDiv = document.createElement('div');
@@ -821,100 +1072,131 @@ document.addEventListener('DOMContentLoaded', () => {
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
-    function addTerminalOutput(text) {
-        const pre = document.createElement('pre');
-        pre.innerText = text;
-        terminalDiv.appendChild(pre);
-        terminalDiv.scrollTop = terminalDiv.scrollHeight;
+    function appendTerminalLine(text) {
+        const line = document.createElement('div');
+        line.className = 'terminal-line';
+        line.innerText = text;
+        terminalDiv.appendChild(line);
+        if (autoScroll) {
+            terminalDiv.scrollTop = terminalDiv.scrollHeight;
+        }
+    }
+
+    function renderTerminalSnapshot(lines) {
+        // Vollreset nur für initiale Snapshot-Ladung oder Log-Rotation,
+        // nicht als normaler Polling-Standardpfad.
+        terminalDiv.innerHTML = '';
+        for (const line of lines) {
+            if (line && line.trim()) {
+                appendTerminalLine(line);
+            }
+        }
     }
 
     async function sendMessage() {
         const msg = messageInput.value.trim();
         if (!msg) return;
-
-        statusDiv.innerText = 'Agent denkt nach...';
+        setStatus('Agent denkt nach...', 'busy');
         addMessage('user', msg);
         messageInput.value = '';
-
         try {
             const response = await fetch('/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ message: msg })
             });
-
             const data = await response.json();
-
             if (data.tool_results && data.tool_results.length > 0) {
                 for (const tr of data.tool_results) {
-                    addMessage('system', `🔧 Tool: ${tr.tool} ${tr.params.join(' ')}`, 'tool');
+                    addMessage('system', `🔧 Tool: ${tr.tool} ${(tr.params || []).join(' ')}`, 'tool');
                     addMessage('system', tr.output, 'tool');
                 }
             }
-
             if (data.reply) {
                 addMessage('assistant', data.reply);
+                setStatus('Bereit', 'ready');
             } else if (data.warning) {
                 addMessage('system', data.warning, 'system');
+                setStatus('Warnung', 'busy');
             } else {
                 addMessage('system', 'Keine gültige Antwort vom Server', 'system');
+                setStatus('Fehler', 'error');
             }
-
-            statusDiv.innerText = 'Bereit';
         } catch (err) {
-            console.error('SEND ERROR:', err);
             addMessage('system', `Fehler: ${err.message}`, 'system');
-            statusDiv.innerText = 'Fehler';
+            setStatus('Fehler', 'error');
         }
     }
 
     async function runCommand() {
         const cmd = cmdInput.value.trim();
         if (!cmd) return;
-
         const repo = repoSelect.value;
-        addTerminalOutput(`> ${cmd} (in ${repo})`);
-
+        appendTerminalLine(`> ${cmd} (in ${repo})`);
         try {
             const response = await fetch(`/terminal?cmd=${encodeURIComponent(cmd)}&repo=${encodeURIComponent(repo)}`);
             const data = await response.json();
-            addTerminalOutput(data.output);
+            appendTerminalLine(data.output || 'Keine Ausgabe');
         } catch (err) {
-            addTerminalOutput(`Fehler: ${err.message}`);
+            appendTerminalLine(`Fehler: ${err.message}`);
         }
-
         cmdInput.value = '';
     }
 
     async function fetchLogs() {
+        if (logsPaused) {
+            return;
+        }
         try {
             const resp = await fetch('/log');
             const data = await resp.json();
+            const lines = Array.isArray(data.lines) ? data.lines : [];
+            const totalLines = Number.isInteger(data.total_lines) ? data.total_lines : lines.length;
+            terminalMeta.innerText = `${lines.length} sichtbare Zeilen · ${totalLines} Gesamtzeilen`;
 
-            if (data.log !== undefined) {
-                terminalDiv.innerHTML = '';
-                const lines = data.log.split('\\n');
-                for (const line of lines) {
-                    if (line.trim()) {
-                        addTerminalOutput(line);
+            if (knownTotalLines === 0 || totalLines < knownTotalLines) {
+                renderTerminalSnapshot(lines.slice(Math.max(0, clearBaseline - Math.max(0, totalLines - lines.length))));
+            } else {
+                const visibleStart = Math.max(clearBaseline, totalLines - lines.length);
+                const appendStart = Math.max(knownTotalLines, visibleStart);
+                const offset = Math.max(0, appendStart - (totalLines - lines.length));
+                for (const line of lines.slice(offset)) {
+                    if (line && line.trim()) {
+                        appendTerminalLine(line);
                     }
                 }
             }
+
+            knownTotalLines = totalLines;
         } catch (err) {
-            console.error('Log-Fehler:', err);
+            terminalMeta.innerText = `Log-Fehler: ${err.message}`;
         }
     }
 
+    clearTerminalBtn.onclick = () => {
+        // Lokales Clear-Verhalten auf Nutzeraktion, nicht automatischer Polling-Reset.
+        terminalDiv.innerHTML = '';
+        clearBaseline = knownTotalLines;
+        terminalMeta.innerText = 'Terminal lokal geleert.';
+    };
+
+    pauseLogsBtn.onclick = () => {
+        logsPaused = !logsPaused;
+        pauseLogsBtn.innerText = logsPaused ? 'Logs pausiert' : 'Pause Logs';
+        logState.innerText = logsPaused ? 'Polling pausiert' : 'Polling aktiv';
+        pauseLogsBtn.classList.toggle('toggle-on', logsPaused);
+    };
+
+    autoscrollBtn.onclick = () => {
+        autoScroll = !autoScroll;
+        autoscrollBtn.innerText = autoScroll ? 'Autoscroll' : 'Autoscroll aus';
+        autoscrollBtn.classList.toggle('toggle-on', autoScroll);
+    };
+
     sendBtn.onclick = sendMessage;
     runCmdBtn.onclick = runCommand;
-
-    messageInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') sendMessage();
-    });
-
-    cmdInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') runCommand();
-    });
+    messageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+    cmdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') runCommand(); });
 
     setInterval(fetchLogs, 2000);
     fetchLogs();
@@ -924,6 +1206,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </html>'''
     return HTMLResponse(content=html)
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=HOST, port=PORT)
