@@ -958,6 +958,7 @@ async def get_log():
 async def health():
     _ensure_handoff_dir()
     model_name = os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b")
+    handoff_count = len(list_handoff_records(limit=100))
 
     return {
         "status": "ok",
@@ -966,6 +967,7 @@ async def health():
         "model": model_name,
         "handoff_dir": HANDOFF_DIR,
         "handoff_dir_exists": os.path.isdir(HANDOFF_DIR),
+        "handoff_count": handoff_count,
         "repos": sorted(REPO_PATHS.keys()),
     }
 
