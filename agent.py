@@ -505,12 +505,18 @@ ANTWORT:
 
     def query(self, user_input, extra_context=None):
         prompt = self.build_prompt(user_input, extra_context=extra_context)
+        model_name = os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b")
 
-        response = ollama.chat(
-            model="qwen2.5-coder:7b",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        reply = response["message"]["content"]
+        try:
+            response = ollama.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            reply = response["message"]["content"]
+        except Exception as e:
+            reply = f"Agent-Fehler beim Modellaufruf ({model_name}): {e}"
+            log_message(f"OLLAMA_ERROR model={model_name} error={e}")
+
         self.memory.append((user_input, reply))
         return reply
 
@@ -894,10 +900,17 @@ async def get_log():
 
 @app.get("/health")
 async def health():
+    _ensure_handoff_dir()
+    model_name = os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b")
+
     return {
         "status": "ok",
         "service": "efro-agent",
-        "time": datetime.now().isoformat()
+        "time": datetime.now().isoformat(),
+        "model": model_name,
+        "handoff_dir": HANDOFF_DIR,
+        "handoff_dir_exists": os.path.isdir(HANDOFF_DIR),
+        "repos": sorted(REPO_PATHS.keys()),
     }
 
 @app.get("/")
