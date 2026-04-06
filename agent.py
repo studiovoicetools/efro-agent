@@ -1355,6 +1355,7 @@ async def root(handoff_id: Optional[str] = None):
         </div>
         <div class="status-cluster">
             <div id="status" class="status-badge ready">Bereit</div>
+            <div id="runtime-pill" class="meta-pill">Lade Runtime…</div>
             <div id="handoff-pill" class="meta-pill" style="display:none;"></div>
             <div class="meta-pill">UI Fokus: ruhig, lesbar, operativ</div>
         </div>
@@ -1441,6 +1442,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const pauseLogsToggle = document.getElementById('pause-logs-toggle');
     const logMeta = document.getElementById('log-meta');
     const handoffId = document.body.dataset.handoffId;
+    const runtimePill = document.getElementById('runtime-pill');
     const handoffPill = document.getElementById('handoff-pill');
     const handoffList = document.getElementById('handoff-list');
 
@@ -1505,6 +1507,21 @@ document.addEventListener('DOMContentLoaded', () => {
             renderRecentHandoffs(data.items || []);
         } catch (err) {
             handoffList.innerHTML = `<div class="empty-state">Handoffs konnten nicht geladen werden: ${err.message}</div>`;
+        }
+    }
+
+    async function loadHealthStatus() {
+        if (!runtimePill) return;
+
+        try {
+            const resp = await fetch('/health');
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            runtimePill.innerText = `Runtime · ${data.model || 'n/a'} · Handoffs ${data.handoff_count ?? 'n/a'}`;
+        } catch (err) {
+            runtimePill.innerText = `Runtime Fehler · ${err.message}`;
         }
     }
 
@@ -1691,8 +1708,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setInterval(() => fetchLogs(false), 2000);
     setInterval(() => loadRecentHandoffs(), 15000);
+    setInterval(() => loadHealthStatus(), 15000);
     fetchLogs(true);
     loadRecentHandoffs();
+    loadHealthStatus();
     loadHandoffContext();
 });
 </script>
