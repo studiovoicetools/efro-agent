@@ -747,60 +747,397 @@ def render_request(endpoint: str, api_token: str, method="GET", data=None):
 @app.get("/log")
 async def get_log():
     try:
-        with open(LOG_FILE, "r") as f:
-            lines = f.readlines()[-100:]  # letzte 100 Zeilen
-        return {"log": "".join(lines)}
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f.readlines()]
+        tail_lines = lines[-200:]
+        return {
+            "log": "\n".join(tail_lines),
+            "lines": tail_lines,
+            "total_lines": len(lines)
+        }
     except Exception as e:
-        return {"log": f"Log file not readable: {e}"}
+        return {
+            "log": f"Log file not readable: {e}",
+            "lines": [],
+            "total_lines": 0
+        }
 
 @app.get("/")
 async def root():
     html = '''<!DOCTYPE html>
-<html>
+<html lang="de">
 <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Efro Agent</title>
     <style>
-        body { font-family: sans-serif; display: flex; margin: 0; }
-        #chat { width: 60%; border-right: 1px solid #ccc; padding: 10px; display: flex; flex-direction: column; height: 100vh; }
-        #terminal { width: 40%; padding: 10px; background: #1e1e1e; color: #d4d4d4; font-family: monospace; overflow-y: auto; height: 100vh; }
-        #messages { flex: 1; overflow-y: auto; border-bottom: 1px solid #ccc; margin-bottom: 10px; }
-        .message { margin: 8px; padding: 6px; border-radius: 8px; max-width: 90%; word-wrap: break-word; }
-        .user { background: #007acc; color: white; align-self: flex-end; }
-        .assistant { background: #f1f1f1; color: black; align-self: flex-start; }
-        .tool { background: #2ecc71; color: white; align-self: flex-start; font-family: monospace; }
-        .system { background: #f39c12; color: white; align-self: flex-start; font-family: monospace; }
-        #status { background: #34495e; color: white; padding: 5px; margin-bottom: 10px; border-radius: 4px; font-size: 12px; text-align: center; }
-        #input-area { display: flex; }
-        #message-input { flex: 1; padding: 8px; }
-        button { padding: 8px; }
-        .command-output { background: #2d2d2d; color: #ccc; padding: 5px; margin-top: 5px; font-family: monospace; white-space: pre-wrap; }
+        :root {
+            color-scheme: dark;
+            --bg: #0b1020;
+            --panel: #121a2b;
+            --panel-2: #182236;
+            --panel-3: #0f1728;
+            --border: #26324d;
+            --text: #eef2ff;
+            --muted: #9ca8c3;
+            --accent: #7c9cff;
+            --accent-2: #3dd9b0;
+            --danger: #ff6b7a;
+            --warning: #ffb454;
+            --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        }
+
+        * { box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            margin: 0;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(180deg, #0a0f1d 0%, #0e1528 100%);
+            color: var(--text);
+        }
+
+        .app-shell {
+            min-height: 100vh;
+            padding: 20px;
+            display: grid;
+            grid-template-rows: auto 1fr;
+            gap: 18px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            padding: 18px 20px;
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            background: rgba(18, 26, 43, 0.92);
+            box-shadow: var(--shadow);
+        }
+
+        .title-wrap h1 {
+            margin: 0;
+            font-size: 22px;
+            line-height: 1.2;
+        }
+
+        .title-wrap p {
+            margin: 6px 0 0;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .status-cluster {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .status-badge,
+        .meta-pill {
+            border: 1px solid var(--border);
+            background: var(--panel-3);
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .status-badge.ready { color: #b8ffd6; border-color: rgba(61, 217, 176, 0.35); }
+        .status-badge.thinking { color: #d7e3ff; border-color: rgba(124, 156, 255, 0.35); }
+        .status-badge.error { color: #ffd4d9; border-color: rgba(255, 107, 122, 0.35); }
+
+        .main-grid {
+            min-height: 0;
+            display: grid;
+            grid-template-columns: minmax(360px, 1.1fr) minmax(420px, 0.9fr);
+            gap: 18px;
+        }
+
+        .panel {
+            min-height: 0;
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            background: rgba(18, 26, 43, 0.94);
+            box-shadow: var(--shadow);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 18px 20px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .panel-title {
+            margin: 0;
+            font-size: 16px;
+        }
+
+        .panel-subtitle {
+            margin: 4px 0 0;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .messages {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .message {
+            max-width: 92%;
+            padding: 12px 14px;
+            border-radius: 16px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            border: 1px solid transparent;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: linear-gradient(135deg, #6f8fff, #5575ff);
+            color: white;
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background: #eef2ff;
+            color: #101828;
+        }
+
+        .message.tool {
+            align-self: flex-start;
+            background: rgba(61, 217, 176, 0.12);
+            border-color: rgba(61, 217, 176, 0.22);
+            color: #d8fff4;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        .message.system {
+            align-self: flex-start;
+            background: rgba(255, 180, 84, 0.12);
+            border-color: rgba(255, 180, 84, 0.22);
+            color: #ffe7c2;
+        }
+
+        .composer {
+            border-top: 1px solid var(--border);
+            padding: 16px 18px 18px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            background: rgba(15, 23, 40, 0.9);
+        }
+
+        .text-input,
+        .command-input,
+        .repo-select {
+            width: 100%;
+            border: 1px solid var(--border);
+            background: var(--panel-3);
+            color: var(--text);
+            border-radius: 12px;
+            padding: 12px 14px;
+            outline: none;
+            font-size: 14px;
+        }
+
+        .button-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 1px solid var(--border);
+            background: var(--panel-2);
+            color: var(--text);
+            border-radius: 12px;
+            padding: 10px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            border-color: rgba(124, 156, 255, 0.4);
+        }
+
+        button.primary {
+            background: linear-gradient(135deg, #6d8dff, #4d6fff);
+            border-color: rgba(124, 156, 255, 0.45);
+        }
+
+        button.ghost {
+            background: transparent;
+        }
+
+        .terminal-wrap {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .terminal-toolbar {
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .terminal-controls,
+        .terminal-toggles {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .toggle {
+            display: inline-flex;
+            gap: 8px;
+            align-items: center;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .terminal-output {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 16px 18px 20px;
+            background: #0a1020;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .terminal-line {
+            margin: 0 0 8px;
+            padding: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: #dbe4ff;
+        }
+
+        .terminal-line.command {
+            color: #9dc1ff;
+        }
+
+        .terminal-line.muted {
+            color: var(--muted);
+        }
+
+        .terminal-footer {
+            border-top: 1px solid var(--border);
+            padding: 16px 18px 18px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto auto;
+            gap: 10px;
+            background: rgba(15, 23, 40, 0.9);
+        }
+
+        .empty-state {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        @media (max-width: 1100px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
-<div id="chat">
-    <h3>Efro Agent – Chat</h3>
-    <div id="status">Bereit</div>
-    <div id="messages"></div>
-    <div id="input-area">
-        <input type="text" id="message-input" placeholder="Nachricht...">
-        <button id="send-btn">Senden</button>
-    </div>
-</div>
-<div id="terminal">
-    <h3>Terminal</h3>
-    <div id="terminal-output"></div>
-    <div style="margin-top: 10px;">
-        <input type="text" id="cmd-input" placeholder="Befehl...">
-        <button id="run-cmd">Ausführen</button>
-        <select id="repo-select">
-            <option value="efro">efro (Landing Page)</option>
-            <option value="brain">Brain API</option>
-            <option value="widget">Widget (Avatar)</option>
-            <option value="shopify">Shopify App</option>
-        </select>
-    </div>
-</div>
+<div class="app-shell">
+    <header class="topbar">
+        <div class="title-wrap">
+            <h1>EFRO Agent Control Surface</h1>
+            <p>Operator-Assistenz für Repos, Incidents und technische Prüfung.</p>
+        </div>
+        <div class="status-cluster">
+            <div id="status" class="status-badge ready">Bereit</div>
+            <div class="meta-pill">UI Fokus: ruhig, lesbar, operativ</div>
+        </div>
+    </header>
 
+    <main class="main-grid">
+        <section class="panel">
+            <div class="panel-header">
+                <div>
+                    <h2 class="panel-title">Chat</h2>
+                    <p class="panel-subtitle">Nachrichten, Tool-Ergebnisse und Agent-Antworten</p>
+                </div>
+            </div>
+            <div id="messages" class="messages">
+                <div class="empty-state">Noch keine Unterhaltung. Starte mit einer Nachricht oder einem direkten Repo-Befehl.</div>
+            </div>
+            <div class="composer">
+                <input type="text" id="message-input" class="text-input" placeholder="Nachricht an den Agenten...">
+                <button id="send-btn" class="primary">Senden</button>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-header">
+                <div>
+                    <h2 class="panel-title">Terminal & Logs</h2>
+                    <p class="panel-subtitle">Stabile Log-Ansicht ohne komplettes Rebuild bei jedem Poll</p>
+                </div>
+            </div>
+
+            <div class="terminal-wrap">
+                <div class="terminal-toolbar">
+                    <div class="terminal-controls">
+                        <select id="repo-select" class="repo-select">
+                            <option value="efro">efro · Landing Page</option>
+                            <option value="brain">brain · API</option>
+                            <option value="widget">widget · Avatar</option>
+                            <option value="shopify">shopify · App</option>
+                        </select>
+                        <button id="clear-terminal" class="ghost">Clear Terminal</button>
+                        <button id="copy-terminal" class="ghost">Copy Logs</button>
+                    </div>
+                    <div class="terminal-toggles">
+                        <label class="toggle"><input type="checkbox" id="autoscroll-toggle" checked> Autoscroll</label>
+                        <label class="toggle"><input type="checkbox" id="pause-logs-toggle"> Pause Logs</label>
+                        <div id="log-meta" class="meta-pill">0 Zeilen</div>
+                    </div>
+                </div>
+
+                <div id="terminal-output" class="terminal-output">
+                    <div class="empty-state">Noch keine Log-Ausgabe geladen.</div>
+                </div>
+
+                <div class="terminal-footer">
+                    <input type="text" id="cmd-input" class="command-input" placeholder="Befehl eingeben...">
+                    <button id="run-cmd">Ausführen</button>
+                    <button id="refresh-logs" class="ghost">Logs aktualisieren</button>
+                </div>
+            </div>
+        </section>
+    </main>
+</div>
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {
@@ -812,27 +1149,57 @@ document.addEventListener('DOMContentLoaded', () => {
     const runCmdBtn = document.getElementById('run-cmd');
     const repoSelect = document.getElementById('repo-select');
     const statusDiv = document.getElementById('status');
+    const clearTerminalBtn = document.getElementById('clear-terminal');
+    const copyTerminalBtn = document.getElementById('copy-terminal');
+    const refreshLogsBtn = document.getElementById('refresh-logs');
+    const autoscrollToggle = document.getElementById('autoscroll-toggle');
+    const pauseLogsToggle = document.getElementById('pause-logs-toggle');
+    const logMeta = document.getElementById('log-meta');
+
+    let terminalInitialized = false;
+    let lastRenderedLineCount = 0;
+
+    function setStatus(state, label) {
+        statusDiv.className = `status-badge ${state}`;
+        statusDiv.innerText = label;
+    }
+
+    function clearEmptyState(container) {
+        const empty = container.querySelector('.empty-state');
+        if (empty) empty.remove();
+    }
 
     function addMessage(role, text, extraClass = '') {
+        clearEmptyState(messagesDiv);
         const msgDiv = document.createElement('div');
-        msgDiv.className = `message ${role} ${extraClass}`;
+        msgDiv.className = `message ${role} ${extraClass}`.trim();
         msgDiv.innerText = text;
         messagesDiv.appendChild(msgDiv);
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
-    function addTerminalOutput(text) {
+    function appendTerminalLine(text, extraClass = '') {
+        clearEmptyState(terminalDiv);
         const pre = document.createElement('pre');
+        pre.className = `terminal-line ${extraClass}`.trim();
         pre.innerText = text;
         terminalDiv.appendChild(pre);
-        terminalDiv.scrollTop = terminalDiv.scrollHeight;
+        if (autoscrollToggle.checked) {
+            terminalDiv.scrollTop = terminalDiv.scrollHeight;
+        }
+    }
+
+    function resetTerminal() {
+        terminalDiv.innerHTML = '<div class="empty-state">Terminal geleert. Neue Log-Zeilen erscheinen hier automatisch.</div>';
+        terminalInitialized = true;
+        logMeta.innerText = 'Ansicht geleert';
     }
 
     async function sendMessage() {
         const msg = messageInput.value.trim();
         if (!msg) return;
 
-        statusDiv.innerText = 'Agent denkt nach...';
+        setStatus('thinking', 'Agent denkt nach');
         addMessage('user', msg);
         messageInput.value = '';
 
@@ -847,24 +1214,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (data.tool_results && data.tool_results.length > 0) {
                 for (const tr of data.tool_results) {
-                    addMessage('system', `🔧 Tool: ${tr.tool} ${tr.params.join(' ')}`, 'tool');
-                    addMessage('system', tr.output, 'tool');
+                    addMessage('tool', `🔧 Tool: ${tr.tool} ${tr.params.join(' ')}`);
+                    addMessage('tool', tr.output || 'Keine Tool-Ausgabe');
                 }
             }
 
             if (data.reply) {
                 addMessage('assistant', data.reply);
+                setStatus('ready', 'Bereit');
             } else if (data.warning) {
-                addMessage('system', data.warning, 'system');
+                addMessage('system', data.warning);
+                setStatus('error', 'Warnung');
             } else {
-                addMessage('system', 'Keine gültige Antwort vom Server', 'system');
+                addMessage('system', 'Keine gültige Antwort vom Server');
+                setStatus('error', 'Fehler');
             }
-
-            statusDiv.innerText = 'Bereit';
         } catch (err) {
             console.error('SEND ERROR:', err);
-            addMessage('system', `Fehler: ${err.message}`, 'system');
-            statusDiv.innerText = 'Fehler';
+            addMessage('system', `Fehler: ${err.message}`);
+            setStatus('error', 'Fehler');
         }
     }
 
@@ -873,33 +1241,53 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!cmd) return;
 
         const repo = repoSelect.value;
-        addTerminalOutput(`> ${cmd} (in ${repo})`);
+        appendTerminalLine(`> ${cmd} (in ${repo})`, 'command');
 
         try {
             const response = await fetch(`/terminal?cmd=${encodeURIComponent(cmd)}&repo=${encodeURIComponent(repo)}`);
             const data = await response.json();
-            addTerminalOutput(data.output);
+            appendTerminalLine(data.output || 'Keine Ausgabe');
         } catch (err) {
-            addTerminalOutput(`Fehler: ${err.message}`);
+            appendTerminalLine(`Fehler: ${err.message}`);
         }
 
         cmdInput.value = '';
     }
 
-    async function fetchLogs() {
+    async function fetchLogs(force = false) {
+        if (pauseLogsToggle.checked && !force) return;
+
         try {
             const resp = await fetch('/log');
             const data = await resp.json();
+            const lines = Array.isArray(data.lines) ? data.lines : [];
 
-            if (data.log !== undefined) {
+            logMeta.innerText = `${data.total_lines || lines.length} Zeilen`;
+
+            if (!terminalInitialized) {
                 terminalDiv.innerHTML = '';
-                const lines = data.log.split('\\n');
                 for (const line of lines) {
-                    if (line.trim()) {
-                        addTerminalOutput(line);
-                    }
+                    if (line.trim()) appendTerminalLine(line);
                 }
+                terminalInitialized = true;
+                lastRenderedLineCount = lines.length;
+                return;
             }
+
+            if (lines.length < lastRenderedLineCount) {
+                terminalDiv.innerHTML = '';
+                for (const line of lines) {
+                    if (line.trim()) appendTerminalLine(line);
+                }
+                lastRenderedLineCount = lines.length;
+                return;
+            }
+
+            const newLines = lines.slice(lastRenderedLineCount);
+            for (const line of newLines) {
+                if (line.trim()) appendTerminalLine(line);
+            }
+            lastRenderedLineCount = lines.length;
         } catch (err) {
             console.error('Log-Fehler:', err);
         }
@@ -907,6 +1295,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     sendBtn.onclick = sendMessage;
     runCmdBtn.onclick = runCommand;
+    clearTerminalBtn.onclick = resetTerminal;
+    copyTerminalBtn.onclick = async () => {
+        try {
+            await navigator.clipboard.writeText(terminalDiv.innerText || '');
+            appendTerminalLine('[info] Logs in die Zwischenablage kopiert.', 'muted');
+        } catch (err) {
+            appendTerminalLine(`[warn] Copy fehlgeschlagen: ${err.message}`, 'muted');
+        }
+    };
+    refreshLogsBtn.onclick = () => fetchLogs(true);
 
     messageInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') sendMessage();
@@ -916,8 +1314,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.key === 'Enter') runCommand();
     });
 
-    setInterval(fetchLogs, 2000);
-    fetchLogs();
+    setInterval(() => fetchLogs(false), 2000);
+    fetchLogs(true);
 });
 </script>
 </body>
