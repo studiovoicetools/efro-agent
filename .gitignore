@@ -9,3 +9,4 @@ __pycache__/
 *.bak
 *.sqlite3
 elevenlabs-agent-*.json
+elevenlabs-agents-list.json
