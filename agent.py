@@ -1464,15 +1464,31 @@ document.addEventListener('DOMContentLoaded', () => {
             const summary = (item.summary || 'Keine Zusammenfassung').trim();
             const shortSummary = summary.length > 140 ? `${summary.slice(0, 137)}...` : summary;
 
-            card.innerHTML = `
-                <div class="handoff-item-header">
-                    <div class="handoff-item-title">${item.incident_id}</div>
-                    <div class="handoff-item-meta">${item.priority} · ${item.severity}</div>
-                </div>
-                <div class="handoff-item-meta">${item.shop_domain} · ${item.likely_repo} / ${item.likely_subsystem}</div>
-                <div class="handoff-item-summary">${shortSummary}</div>
-            `;
+            const header = document.createElement('div');
+            header.className = 'handoff-item-header';
 
+            const title = document.createElement('div');
+            title.className = 'handoff-item-title';
+            title.textContent = item.incident_id || 'Unbekannter Incident';
+
+            const metaRight = document.createElement('div');
+            metaRight.className = 'handoff-item-meta';
+            metaRight.textContent = `${item.priority || 'n/a'} · ${item.severity || 'n/a'}`;
+
+            header.appendChild(title);
+            header.appendChild(metaRight);
+
+            const metaLine = document.createElement('div');
+            metaLine.className = 'handoff-item-meta';
+            metaLine.textContent = `${item.shop_domain || 'kein Shop'} · ${item.likely_repo || 'kein Repo'} / ${item.likely_subsystem || 'kein Subsystem'}`;
+
+            const summaryLine = document.createElement('div');
+            summaryLine.className = 'handoff-item-summary';
+            summaryLine.textContent = shortSummary;
+
+            card.appendChild(header);
+            card.appendChild(metaLine);
+            card.appendChild(summaryLine);
             handoffList.appendChild(card);
         }
     }
