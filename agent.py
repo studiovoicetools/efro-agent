@@ -651,10 +651,32 @@ async def call_tool(req: ToolRequest):
 # --- Chat-Endpunkt ---
 class ChatRequest(BaseModel):
     message: str
+    handoff_id: Optional[str] = None
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_input = req.message.strip()
+    handoff_context = None
+
+    if req.handoff_id:
+        try:
+            handoff_record = load_handoff_record(req.handoff_id)
+            handoff_context = (
+                f"Handoff {handoff_record.handoff_id}\n"
+                f"Incident: {handoff_record.incident_id}\n"
+                f"Shop: {handoff_record.shop_domain}\n"
+                f"Priorität: {handoff_record.priority}\n"
+                f"Severity: {handoff_record.severity}\n"
+                f"Scope: {handoff_record.scope}\n"
+                f"Repo: {handoff_record.likely_repo}\n"
+                f"Subsystem: {handoff_record.likely_subsystem}\n"
+                f"Summary: {handoff_record.summary}\n"
+                f"Top Findings: {' | '.join(handoff_record.top_findings) if handoff_record.top_findings else 'Keine Angaben'}\n"
+                f"Checks Run: {' | '.join(handoff_record.checks_run) if handoff_record.checks_run else 'Keine Angaben'}\n"
+                f"Recommended Next Action: {handoff_record.recommended_next_action}"
+            )
+        except HTTPException:
+            handoff_context = f"Handoff {req.handoff_id} nicht gefunden"
 
     # -------- DIRECT COMMAND MODE (SCHNELL + VERTRAUENSWÜRDIG) --------
     direct = parse_direct_command(user_input)
@@ -754,6 +776,9 @@ async def chat(req: ChatRequest):
     max_tool_calls = 10
     current_input = user_input
     conversation_history = []
+
+    if handoff_context:
+        conversation_history.append(("handoff", handoff_context))
 
     for _ in range(max_tool_calls):
         reply = agent.query(current_input, extra_context=conversation_history)
@@ -1419,7 +1444,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: msg })
+                body: JSON.stringify({ message: msg, handoff_id: handoffId || null })
             });
 
             const data = await response.json();
