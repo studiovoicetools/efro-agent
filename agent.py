@@ -236,6 +236,26 @@ def load_handoff_record(handoff_id: str) -> HandoffRecord:
         payload = json.load(f)
 
     return HandoffRecord(**payload)
+
+
+def list_handoff_records(limit: int = 25) -> list[dict[str, Any]]:
+    _ensure_handoff_dir()
+    records: list[HandoffRecord] = []
+
+    for entry in os.listdir(HANDOFF_DIR):
+        if not entry.endswith('.json'):
+            continue
+
+        path = os.path.join(HANDOFF_DIR, entry)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            records.append(HandoffRecord(**payload))
+        except Exception as e:
+            log_message(f"HANDOFF_LIST_SKIP file={entry} error={e}")
+
+    records.sort(key=lambda record: record.created_at, reverse=True)
+    return [record.model_dump() for record in records[:limit]]
         
 # --- Vercel API (Logs, Deployments) ---
 
@@ -545,6 +565,17 @@ async def get_handoff(handoff_id: str):
     record = load_handoff_record(handoff_id)
     log_message(f"HANDOFF_LOAD handoff_id={record.handoff_id} incident_id={record.incident_id}")
     return record.model_dump()
+
+
+@app.get("/api/handoffs")
+async def get_handoffs(limit: int = 25):
+    safe_limit = max(1, min(limit, 100))
+    records = list_handoff_records(limit=safe_limit)
+    return {
+        "count": len(records),
+        "limit": safe_limit,
+        "items": records,
+    }
 
 
 @app.post("/tool")
