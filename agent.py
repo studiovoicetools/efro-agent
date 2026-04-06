@@ -1,19 +1,32 @@
 import os
 import subprocess
 import json
-import ollama
 import re
 from pathlib import Path
 from threading import Lock
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import chromadb
-from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from datetime import datetime
+
+try:
+    import ollama  # type: ignore
+except ImportError:
+    ollama = None
+
+try:
+    import chromadb  # type: ignore
+    from chromadb.utils import embedding_functions  # type: ignore
+except ImportError:
+    chromadb = None
+    embedding_functions = None
+
+try:
+    from sentence_transformers import SentenceTransformer  # type: ignore
+except ImportError:
+    SentenceTransformer = None
 
 load_dotenv()
 
@@ -63,20 +76,41 @@ REPO_PATHS = {
 }
 # -----------------------------------
 
-# --- Embedding-Funktion (lokal) ---
-class LocalEmbeddingFunction(embedding_functions.EmbeddingFunction):
-    def __init__(self):
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-    def __call__(self, texts):
-        return self.model.encode(texts).tolist()
+# --- Embedding-Funktion (lokal / optional) ---
+if embedding_functions is not None:
+    class LocalEmbeddingFunction(embedding_functions.EmbeddingFunction):
+        def __init__(self):
+            if SentenceTransformer is None:
+                raise RuntimeError("sentence_transformers nicht verfügbar")
+            self.model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# --- Chroma Client ---
-client = chromadb.PersistentClient(path="/opt/efro-agent/chroma_db")
-embedding_fn = LocalEmbeddingFunction()
-collection = client.get_collection(
-    name="efro_code",
-    embedding_function=embedding_fn
-)
+        def __call__(self, texts):
+            return self.model.encode(texts).tolist()
+else:
+    class LocalEmbeddingFunction:
+        def __init__(self):
+            raise RuntimeError("chromadb embedding_functions nicht verfügbar")
+
+        def __call__(self, texts):
+            raise RuntimeError("Embedding-Funktion nicht verfügbar")
+
+# --- Chroma Client (optional) ---
+client = None
+embedding_fn = None
+collection = None
+if chromadb is not None and embedding_functions is not None and SentenceTransformer is not None:
+    try:
+        client = chromadb.PersistentClient(path=str(BASE_DIR / "chroma_db"))
+        embedding_fn = LocalEmbeddingFunction()
+        collection = client.get_or_create_collection(
+            name="efro_code",
+            embedding_function=embedding_fn
+        )
+    except Exception as e:
+        log_message(f"Chroma deaktiviert: {e}")
+        client = None
+        embedding_fn = None
+        collection = None
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -382,6 +416,15 @@ ANTWORT:
 
     def query(self, user_input, extra_context=None):
         prompt = self.build_runtime_prompt(user_input, extra_context=extra_context)
+        if ollama is None:
+            reply = (
+                "Ollama ist in dieser Laufzeitumgebung nicht installiert. "
+                "Health-, Handoff- und UI-Endpunkte bleiben verfügbar, "
+                "aber Chat-Antworten über das lokale LLM sind derzeit nicht nutzbar."
+            )
+            self.memory.append((user_input, reply))
+            return reply
+
         response = ollama.chat(
             model="qwen2.5-coder:7b",
             messages=[{"role": "user", "content": prompt}]
