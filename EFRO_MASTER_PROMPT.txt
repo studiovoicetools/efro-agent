@@ -1,0 +1,512 @@
+EFRO MASTER TRUTH / SINGLE SOURCE OF TRUTH
+
+PRODUKTNAME:
+EFRO
+
+PRODUKTBESCHREIBUNG:
+EFRO ist ein AI Avatar Seller System für Shopify Stores.
+EFRO soll wie ein digitaler Top-Verkäufer arbeiten:
+- Besucher begrüßen
+- Produkte erklären
+- Vertrauen aufbauen
+- Fragen beantworten
+- Produkte empfehlen
+- Einwände behandeln
+- Conversion steigern
+- Upsells und Cross-Sells auslösen
+
+EFRO besteht nicht nur aus einem Chatbot.
+EFRO ist ein mehrsprachiger, verkaufsstarker, datengetriebener Avatar-Verkaufsmitarbeiter für E-Commerce.
+
+HAUPTZIEL:
+EFRO soll ein professionelles SaaS-Produkt werden, das von möglichst vielen Shopify-Shops genutzt werden kann.
+Das System soll skalierbar, stabil, leicht installierbar, verständlich, verkaufsstark und profitabel sein.
+
+GESCHÄFTSZIEL:
+Nicht nur wenige Kunden mit sehr hohem Preis.
+Ziel ist ein smartes, massentaugliches SaaS-Modell mit hoher Verbreitung.
+Der Fokus liegt auf:
+- starker Preis-Leistung
+- einfacher Nutzung
+- hoher Conversion für viele Shops
+- wiederkehrenden Einnahmen
+- späterer Skalierung
+
+PREISSTRATEGIE / HYPOTHESE:
+EFRO soll intelligente Abo-Preise haben.
+Aktuelle Preisidee:
+- Einstieg ca. 49 EUR
+- Mid-Tier ca. 99 EUR bis 149 EUR
+- Premium ca. 249 EUR bis 299 EUR oder mehr
+
+WICHTIG:
+Der Agent soll den wahrgenommenen Wert von EFRO analysieren.
+Der Agent soll Pricing nicht blind annehmen, sondern bewerten:
+- Wie hoch ist der wirtschaftliche Mehrwert für Shops?
+- Wie stark ist die Conversion-Steigerung?
+- Welche Features rechtfertigen welchen Preis?
+- Wo ist Massenmarkt sinnvoller als Enterprise-Only?
+- Welche Version eignet sich für kleine Shops, welche für größere?
+
+PRICING-DENKEN:
+Das Ziel ist nicht automatisch, nur 100 Kunden mit 1000 EUR zu haben.
+Das Ziel ist eine intelligente Balance aus:
+- Zugänglichkeit
+- Wachstum
+- hoher Marktakzeptanz
+- wiederkehrendem Umsatz
+- Upgrade-Potenzial
+
+PRODUKTKOMPONENTEN:
+1. Landingpage
+2. Adminbereich
+3. Shop-Scan / Shop-Analyse
+4. Empfehlungslogik / AI Brain
+5. Avatar-Widget
+6. Voice + Lipsync
+7. Shopify App / Installation / Onboarding
+8. Monitoring / Fehlererkennung / Qualitätskontrolle
+9. Caching / Kostenoptimierung
+10. Mehrsprachigkeit
+11. Supabase Datenspeicherung
+12. Performance-Optimierung
+
+LANDINGPAGE ZIEL:
+Die Landingpage soll EFRO stark verkaufen.
+Der Avatar soll sich idealerweise selbst verkaufen können.
+Die Landingpage muss:
+- professionell aussehen
+- Vertrauen erzeugen
+- Nutzen in Sekunden verständlich machen
+- Conversion-fokussiert sein
+- SaaS-würdig wirken
+- modern und hochwertig sein
+
+LANDINGPAGE MUSS KLAR MACHEN:
+- Was EFRO ist
+- Warum es wertvoll ist
+- Warum es Umsatz steigern kann
+- Für wen es gedacht ist
+- Warum ein Shop EFRO sofort installieren sollte
+- Welche Probleme EFRO löst
+- Warum EFRO besser ist als nur normaler Chat oder FAQ
+
+LANDINGPAGE FEATURE-ZIELE:
+- klarer Hero
+- starke Positionierung
+- Pricing-Bereich
+- Demo / Vorschau
+- Conversion-Beweise
+- Use Cases
+- FAQ
+- technisches Vertrauen
+- einfaches Onboarding in den nächsten Schritt
+
+ADMINBEREICH ZIEL:
+Der Adminbereich soll professionell und leicht verständlich sein.
+Ein Shop-Betreiber soll EFRO einfach konfigurieren können.
+
+ADMINBEREICH SOLL ENTHALTEN:
+- Onboarding
+- Avatar-Auswahl
+- Stimmenauswahl
+- Sprachkonfiguration
+- Shop-Status
+- Monitoring
+- Fehlerübersicht
+- Performance-Überblick
+- Logs
+- Produktscan-Ergebnisse
+- Verbesserungsvorschläge
+- ggf. Pricing / Usage / Limits / Billing
+
+ONBOARDING ZIEL:
+Das Onboarding muss einfach und klar sein.
+Ein neuer Shop soll schnell verstehen:
+- was zu tun ist
+- was EFRO braucht
+- wie EFRO eingerichtet wird
+- wie Sprache und Avatar gewählt werden
+- wie die Produktdaten verarbeitet werden
+- wie EFRO im Shop aktiviert wird
+
+MULTILINGUAL ZIEL:
+EFRO muss mehrsprachig funktionieren.
+Die Sprache soll automatisch zur Shopsprache passen.
+
+MULTILINGUAL REGELN:
+- Sprache soll bei Installation oder Scan erkannt werden
+- Standardmäßig soll EFRO in der Sprache des Shops antworten
+- Spracheinstellungen sollen im Adminbereich sichtbar und veränderbar sein
+- Antwortqualität in DE und EN ist besonders wichtig
+- später weitere Sprachen möglich
+- Store-Wahrheit bleibt lokal korrekt
+- Voice, Text und Avatar-Verhalten müssen sprachlich zusammenpassen
+
+SHOP-SCAN ZIEL:
+Der Shop muss automatisch analysiert werden.
+EFRO soll erkennen:
+- welche Produkte vorhanden sind
+- welche Daten fehlen
+- welche Produkte schwach beschrieben sind
+- welche Produkte schlechte Titel/Beschreibungen haben
+- wo Verbesserungspotenzial besteht
+
+SHOP-SCAN MUSS KÖNNEN:
+- Produkte lesen
+- Kategorien erkennen
+- Metadaten analysieren
+- Qualität bewerten
+- Lücken aufzeigen
+- Verbesserungsvorschläge machen
+- Relevante Daten speichern
+
+SUPABASE ZIEL:
+Produkte und wichtige Shopdaten sollen in Supabase gespeichert werden.
+Das dient:
+- schnelleren Antworten
+- stabileren Empfehlungen
+- weniger API-Abhängigkeit
+- besserem Monitoring
+- besserer Analyse
+- Caching
+- Skalierung
+
+SUPABASE MUSS SPEICHERN:
+- Shop-Metadaten
+- Produktdaten
+- Produktbeschreibungen
+- Produktqualitätsbewertungen
+- Antwort-Caches
+- Fehlerzustände
+- Monitoring-Daten
+- ggf. Nutzungsdaten
+- ggf. Sprachen / Konfiguration / Voice / Avatar-Settings
+
+CACHING ZIEL:
+Antworten müssen intelligent gecached werden, um API-Kosten zu senken.
+EFRO soll nicht ständig dieselbe Antwort neu generieren, wenn dieselbe Frage mit gleichem Kontext schon beantwortet wurde.
+
+CACHING IST KRITISCH WEGEN:
+- API-Kosten
+- Performance
+- Antwortgeschwindigkeit
+- Lipsync/Voice-Kosten
+- wiederholte Standardfragen
+
+CACHING REGELN:
+- gleiche oder sehr ähnliche Fragen sollen wiederverwendet werden können
+- Kontext muss berücksichtigt werden
+- Shop, Sprache, Produkt und Intent müssen Teil des Cache-Schlüssels sein
+- Lipsync-relevante Antworten sollen möglichst effizient wiederverwendet werden
+- Cache darf nicht zu falschen oder veralteten Antworten führen
+- Cache muss invalidierbar sein, wenn Produktdaten sich ändern
+
+MONITORING ZIEL:
+EFRO muss ein perfektes internes Monitoring haben.
+Es soll sichtbar sein:
+- in welchem Shop EFRO stark performt
+- in welchem Shop EFRO schwach performt
+- wo Bugs auftreten
+- wo Conversion leidet
+- wo Voice / Widget / Brain Probleme haben
+- wo Antwortqualität schlecht ist
+
+MONITORING MUSS BEOBACHTEN:
+- Fehler
+- Laufzeiten
+- Antwortzeiten
+- fehlgeschlagene Antworten
+- Shop-spezifische Probleme
+- Eventuell Conversion-indikative Signale
+- Auffälligkeiten nach Sprache oder Shoptyp
+- API-/Tool-/Lipsync-Probleme
+- Synchronisationsprobleme
+
+SENTRY / INTERNES MONITORING:
+Es existiert möglicherweise bereits ein Sentry-Projekt oder Health-Test.
+Der Agent soll entscheiden, ob externe Tools wie Sentry nötig sind oder ob internes Monitoring genügt.
+Interne Lösung ist willkommen, wenn sie stabil, übersichtlich und wartbar ist.
+Externe Dienste sollen nur eingesetzt werden, wenn sie echten Mehrwert bringen.
+
+REPO-BEZUG:
+Repo efro:
+- Landingpage
+- Adminbereich
+- Onboarding
+- Monitoring UI
+- Shop-Status
+- Konfiguration / Avatar / Stimme / Sprache
+
+Repo efro-brain:
+- Recommendation Engine
+- Logik
+- Antwortgenerierung
+- Strategie
+- AI-Flows
+- Caching-Entscheidungen
+- Produktanalyse
+
+Repo efro-widget:
+- Avatar-Widget
+- UI im Shop
+- Voice-Ausgabe
+- Lipsync
+- Nutzererlebnis
+- Performance des eingebetteten Verkaufserlebnisses
+
+Repo efro-shopify:
+- Shopify App
+- Installation
+- Shop-Anbindung
+- Datensynchronisierung
+- Review-relevante Abläufe
+- Berechtigungen
+- App-Stabilität
+
+VOICE / AVATAR / LIPSYNC ZIEL:
+EFRO muss sich hochwertig anfühlen.
+Avatar, Stimme und Lipsync sind nicht nur Deko, sondern zentral für Wahrnehmung, Vertrauen und Conversion.
+Das Erlebnis soll:
+- flüssig
+- natürlich
+- professionell
+- schnell
+- wiederverwendbar
+- kostenbewusst
+sein
+
+SHOPIFY REVIEW PRIORITÄT:
+EFRO muss so gebaut und optimiert werden, dass die Shopify App Review bestmöglich bestanden wird.
+Der Agent soll bei Entscheidungen immer bedenken:
+- Stabilität
+- Klarheit
+- Sicherheit
+- sauberes Onboarding
+- nachvollziehbares Verhalten
+- keine kaputten Flows
+- professioneller Eindruck
+
+KRITISCHE PRODUKTZIELE:
+1. System funktioniert stabil
+2. Shopify Review besteht
+3. Avatar verkauft überzeugend
+4. Adminbereich ist professionell
+5. Monitoring zeigt echte Schwächen
+6. Produktscan erzeugt Mehrwert
+7. Antworten sind schnell
+8. Kosten bleiben kontrollierbar
+9. Multilingual funktioniert sauber
+10. EFRO ist massentauglich
+
+WAS DER AGENT IMMER BEDENKEN MUSS:
+- Business Value
+- technische Stabilität
+- Conversion
+- Kosten
+- Skalierung
+- Wartbarkeit
+- UX
+- Sprachqualität
+- Performance
+- Datenqualität
+- Review-Fähigkeit
+- Monitoring-Fähigkeit
+
+DER AGENT DARF NICHT:
+- blind refactoren
+- bestehende kritische Features zerstören
+- riesige Umbauten ohne Grund machen
+- theoretische Perfektion über Business-Ziele stellen
+- nur technische Eleganz priorisieren, wenn es Conversion oder Review schadet
+
+DER AGENT SOLL IMMER:
+- wie ein CTO denken
+- die Vision kennen
+- Risiken erkennen
+- wertorientiert optimieren
+- pragmatisch entscheiden
+- zuerst die wichtigsten Hebel identifizieren
+- den kleinsten sicheren Schritt wählen
+- bei jeder Änderung fragen:
+  - Wird EFRO dadurch wertvoller?
+  - Wird EFRO dadurch stabiler?
+  - Wird EFRO dadurch verkaufsfähiger?
+  - Wird EFRO dadurch review-fähiger?
+  - Wird EFRO dadurch skalierbarer?
+
+PRIORITÄTENREIHENFOLGE:
+1. Funktioniert das System stabil?
+2. Besteht die App Review?
+3. Erzeugt EFRO echten Shop-Wert?
+4. Ist die UX stark?
+5. Ist Monitoring ausreichend?
+6. Sind Kosten optimiert?
+7. Ist die Architektur skalierbar?
+8. Ist die Preisstrategie sinnvoll?
+
+
+RESPONSIVE DESIGN / DEVICE SUPPORT:
+
+EFRO muss vollständig auf allen Geräten funktionieren:
+- Desktop (Laptop / PC)
+- Tablet
+- Smartphone
+
+WICHTIG:
+- Layout muss sich automatisch anpassen (responsive)
+- Keine UI-Überlappungen
+- Keine abgeschnittenen Elemente
+- Performance muss auch auf schwächeren Geräten stabil sein
+
+AVATAR + CHAT UI:
+
+Standard-Position:
+- Chat: unten rechts (Floating UI)
+- Avatar: sichtbar, optimal positioniert je nach Gerät
+
+DESKTOP:
+- Avatar kann größer dargestellt werden
+- Chat-Fenster größer
+- Mehr Platz für visuelle Elemente
+
+MOBILE:
+- Kompakter Chat
+- Avatar kleiner, aber sichtbar
+- Kein Screen-Blocking
+- Fokus auf schnelle Interaktion
+
+TABLET:
+- Zwischenlösung (adaptive Layout)
+
+UI ZIELE:
+- modern
+- smooth Animationen
+- kein Lag
+- hochwertiger Eindruck
+- Conversion-orientiert
+
+BROWSER SUPPORT:
+
+EFRO muss stabil funktionieren auf:
+- Chrome
+- Safari
+- Firefox
+- Edge
+
+KEINE:
+- JavaScript Errors
+- Rendering Bugs
+- Audio Probleme
+- Lipsync Probleme
+
+VOICE / AUDIO REQUIREMENTS:
+
+- Autoplay nur wenn erlaubt
+- Mobile Browser Einschränkungen beachten
+- Fallback wenn Audio blockiert wird
+- Voice darf UI nicht blockieren
+
+DSGVO / DATENSCHUTZ:
+
+EFRO muss DSGVO-konform sein.
+
+PFLICHT:
+- User muss zustimmen, bevor Interaktion startet
+- Kein Tracking ohne Consent
+- Klare Erklärung:
+  - Was wird gespeichert
+  - Warum wird es gespeichert
+  - Wie wird es verwendet
+
+CONSENT FLOW:
+- Beim ersten Öffnen:
+  - Hinweis anzeigen
+  - Zustimmung einholen
+- Ohne Zustimmung:
+  - Kein Chat
+  - Kein Voice
+  - Kein Tracking
+
+OPTIONEN:
+- Ablehnen möglich
+- Später ändern möglich
+
+LOGGING / DATA:
+
+- Sensible Daten minimieren
+- Keine unnötige Speicherung
+- Logs dürfen keine privaten Inhalte enthalten
+
+PERFORMANCE ZIELE:
+
+- Antwortzeit < 2 Sekunden (gefühlt)
+- UI darf nie „einfrieren“
+- Avatar + Chat müssen flüssig laufen
+- Lazy Loading wo sinnvoll
+
+SMART UX FEATURES (HIGH IMPACT):
+
+- „Denkt gerade nach…“ Animation
+- Typing Indicator
+- Schnelle Vorschläge („Beliebte Fragen“)
+- Kontextbasierte Antworten
+- Wiedererkennung von Nutzerintention
+
+CONVERSION FEATURES:
+
+- Produkt direkt anzeigen (Card)
+- „Jetzt kaufen“ Buttons
+- Upsell / Cross-Sell Vorschläge
+- Vertrauen durch klare Sprache
+- Emotionale Ansprache durch Avatar
+
+ADVANCED FEATURES (OPTIONAL / ZUKUNFT):
+
+- A/B Testing für Avatar-Verhalten
+- Unterschiedliche Verkaufsstrategien testen
+- Conversion Tracking
+- Heatmap / Interaktionsanalyse
+- Automatische Optimierung der Antworten
+- Shop-spezifische Persönlichkeit des Avatars
+
+COST OPTIMIZATION:
+
+- Caching aktiv nutzen
+- Wiederkehrende Antworten vermeiden
+- Voice nur wenn nötig
+- Lipsync effizient nutzen
+- API Calls minimieren
+
+FEHLERFALL-STRATEGIE:
+
+Wenn etwas nicht funktioniert:
+- Fallback auf Text
+- Kein kompletter Absturz
+- Nutzer merkt möglichst wenig
+- Fehler intern loggen
+
+WICHTIGSTE UX REGEL:
+
+Der Nutzer darf NIE das Gefühl haben:
+„Das ist kaputt“ oder „Das ist kompliziert“
+
+Stattdessen:
+- intuitiv
+- schnell
+- hilfreich
+- angenehm
+- verkaufsstark
+
+ENDGOAL UX:
+
+EFRO fühlt sich an wie:
+- ein echter Verkäufer
+- ein smarter Assistent
+- ein hochwertiges Produkt
+
+NICHT wie:
+- ein einfacher Chatbot
+
+ENDZUSTAND:
+EFRO soll ein professionelles, intelligentes, massentaugliches AI-Avatar-Sales-System für Shopify werden, das technisch stark, geschäftlich sinnvoll, stabil, mehrsprachig, monitorbar, kosteneffizient und klar verkaufsfähig ist.

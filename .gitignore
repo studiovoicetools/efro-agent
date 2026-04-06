@@ -1,0 +1,11 @@
+venv/
+repos/
+chroma_db/
+.env
+agent.log
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.sqlite3
+elevenlabs-agent-*.json
