@@ -4,12 +4,63 @@ import json
 import re
 from pathlib import Path
 from threading import Lock
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-from dotenv import load_dotenv
 from datetime import datetime
+
+try:
+    from fastapi import FastAPI, HTTPException  # type: ignore
+    from fastapi.responses import HTMLResponse  # type: ignore
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    class HTMLResponse:
+        def __init__(self, content: str, status_code: int = 200):
+            self.content = content
+            self.status_code = status_code
+
+    class FastAPI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+        def post(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+try:
+    from pydantic import BaseModel  # type: ignore
+except ImportError:
+    class BaseModel:
+        def __init__(self, **kwargs):
+            annotations = getattr(self.__class__, "__annotations__", {})
+            for name in annotations:
+                if name in kwargs:
+                    setattr(self, name, kwargs[name])
+                elif hasattr(self.__class__, name):
+                    setattr(self, name, getattr(self.__class__, name))
+                else:
+                    raise TypeError(f"Missing field: {name}")
+            for key, value in kwargs.items():
+                if not hasattr(self, key):
+                    setattr(self, key, value)
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 try:
     import ollama  # type: ignore
@@ -1250,6 +1301,114 @@ document.addEventListener('DOMContentLoaded', () => {
     return HTMLResponse(content=html)
 
 
+def run_local_dev_server(host: str, port: int):
+    import asyncio
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send_json(self, payload, status=200):
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_html(self, html, status=200):
+            if isinstance(html, HTMLResponse):
+                content = html.content
+                status = html.status_code
+            else:
+                content = str(html)
+            body = content.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json(self):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            return json.loads(raw.decode("utf-8") or "{}")
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            try:
+                if path == "/health":
+                    self._send_json(asyncio.run(health()))
+                    return
+                if path == "/handoffs":
+                    self._send_json(asyncio.run(list_handoffs()))
+                    return
+                if path.startswith("/handoff/"):
+                    handoff_id = path.split("/handoff/", 1)[1]
+                    self._send_json(asyncio.run(get_handoff(handoff_id)))
+                    return
+                if path == "/log":
+                    raw_limit = query.get("limit", [str(LOG_TAIL_LINES)])[0]
+                    try:
+                        limit = int(raw_limit)
+                    except ValueError:
+                        limit = LOG_TAIL_LINES
+                    self._send_json(asyncio.run(get_log(limit=limit)))
+                    return
+                if path == "/terminal":
+                    cmd = query.get("cmd", [""])[0]
+                    repo = query.get("repo", ["brain"])[0]
+                    self._send_json(asyncio.run(terminal(cmd=cmd, repo=repo)))
+                    return
+                if path == "/":
+                    self._send_html(asyncio.run(root()))
+                    return
+                self._send_json({"detail": "Not Found"}, status=404)
+            except HTTPException as exc:
+                self._send_json({"detail": exc.detail}, status=exc.status_code)
+            except Exception as exc:
+                self._send_json({"detail": str(exc)}, status=500)
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            try:
+                payload = self._read_json()
+                if path == "/handoff":
+                    self._send_json(asyncio.run(create_handoff(HandoffRequest(**payload))))
+                    return
+                if path == "/chat":
+                    self._send_json(asyncio.run(chat(ChatRequest(**payload))))
+                    return
+                if path == "/tool":
+                    self._send_json(asyncio.run(call_tool(ToolRequest(**payload))))
+                    return
+                if path == "/optimize":
+                    self._send_json(asyncio.run(optimize(OptimizeRequest(**payload))))
+                    return
+                self._send_json({"detail": "Not Found"}, status=404)
+            except HTTPException as exc:
+                self._send_json({"detail": exc.detail}, status=exc.status_code)
+            except Exception as exc:
+                self._send_json({"detail": str(exc)}, status=500)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    log_message(f"Fallback HTTP server startet auf {host}:{port}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+    try:
+        import uvicorn  # type: ignore
+        UVICORN_AVAILABLE = True
+    except ImportError:
+        UVICORN_AVAILABLE = False
+
+    if FASTAPI_AVAILABLE and UVICORN_AVAILABLE:
+        uvicorn.run(app, host=HOST, port=PORT)
+    else:
+        run_local_dev_server(HOST, PORT)
