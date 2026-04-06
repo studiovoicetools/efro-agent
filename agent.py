@@ -1271,6 +1271,74 @@ async def root(handoff_id: Optional[str] = None):
             font-size: 13px;
         }
 
+        .handoff-panel {
+            margin: 0 18px 0;
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(15, 23, 40, 0.72);
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .handoff-panel-title {
+            margin: 0;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .handoff-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .handoff-item {
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: rgba(11, 16, 32, 0.82);
+            padding: 12px;
+            text-decoration: none;
+            color: var(--text);
+            transition: border-color 0.12s ease, transform 0.12s ease;
+        }
+
+        .handoff-item:hover {
+            border-color: rgba(124, 156, 255, 0.45);
+            transform: translateY(-1px);
+        }
+
+        .handoff-item.active {
+            border-color: rgba(61, 217, 176, 0.45);
+            box-shadow: inset 0 0 0 1px rgba(61, 217, 176, 0.18);
+        }
+
+        .handoff-item-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+
+        .handoff-item-title {
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .handoff-item-meta {
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        .handoff-item-summary {
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.45;
+        }
+
         @media (max-width: 1100px) {
             .main-grid {
                 grid-template-columns: 1fr;
@@ -1298,6 +1366,12 @@ async def root(handoff_id: Optional[str] = None):
                 <div>
                     <h2 class="panel-title">Chat</h2>
                     <p class="panel-subtitle">Nachrichten, Tool-Ergebnisse und Agent-Antworten</p>
+                </div>
+            </div>
+            <div class="handoff-panel">
+                <h3 class="handoff-panel-title">Letzte Handoffs</h3>
+                <div id="handoff-list" class="handoff-list">
+                    <div class="empty-state">Noch keine Handoffs geladen.</div>
                 </div>
             </div>
             <div id="messages" class="messages">
@@ -1368,9 +1442,55 @@ document.addEventListener('DOMContentLoaded', () => {
     const logMeta = document.getElementById('log-meta');
     const handoffId = document.body.dataset.handoffId;
     const handoffPill = document.getElementById('handoff-pill');
+    const handoffList = document.getElementById('handoff-list');
 
     let terminalInitialized = false;
     let lastRenderedLineCount = 0;
+
+    function renderRecentHandoffs(items) {
+        if (!handoffList) return;
+
+        if (!items || items.length === 0) {
+            handoffList.innerHTML = '<div class="empty-state">Noch keine Handoffs vorhanden.</div>';
+            return;
+        }
+
+        handoffList.innerHTML = '';
+        for (const item of items) {
+            const card = document.createElement('a');
+            card.className = `handoff-item ${item.handoff_id === handoffId ? 'active' : ''}`.trim();
+            card.href = `/handoff/${encodeURIComponent(item.handoff_id)}`;
+
+            const summary = (item.summary || 'Keine Zusammenfassung').trim();
+            const shortSummary = summary.length > 140 ? `${summary.slice(0, 137)}...` : summary;
+
+            card.innerHTML = `
+                <div class="handoff-item-header">
+                    <div class="handoff-item-title">${item.incident_id}</div>
+                    <div class="handoff-item-meta">${item.priority} · ${item.severity}</div>
+                </div>
+                <div class="handoff-item-meta">${item.shop_domain} · ${item.likely_repo} / ${item.likely_subsystem}</div>
+                <div class="handoff-item-summary">${shortSummary}</div>
+            `;
+
+            handoffList.appendChild(card);
+        }
+    }
+
+    async function loadRecentHandoffs() {
+        if (!handoffList) return;
+
+        try {
+            const resp = await fetch('/api/handoffs?limit=8');
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            renderRecentHandoffs(data.items || []);
+        } catch (err) {
+            handoffList.innerHTML = `<div class="empty-state">Handoffs konnten nicht geladen werden: ${err.message}</div>`;
+        }
+    }
 
     async function loadHandoffContext() {
         if (!handoffId) return;
@@ -1555,6 +1675,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setInterval(() => fetchLogs(false), 2000);
     fetchLogs(true);
+    loadRecentHandoffs();
     loadHandoffContext();
 });
 </script>
