@@ -304,44 +304,20 @@ class EfroAgent:
         except Exception:
             self.system_prompt = "EFRO MASTER PROMPT NICHT GEFUNDEN"
 
-    def query(self, user_input, extra_context=None):
-        # Chroma vorerst deaktiviert für Speed
-        context = "Kein Kontext (Chroma deaktiviert für Speed)."
-        extra = f"\nZusätzlicher Kontext (Tool-Ergebnisse):\n{extra_context}\n" if extra_context else ""
+        self.runtime_prompt = """
+RUNTIME-LAYER:
+- Nutze den Master Prompt als strategische Wahrheit, aber antworte operativ, kompakt und faktenbasiert.
+- Behandle EFRO als Produkt-, Sales-, Monitoring- und Operator-System, nicht nur als UI oder Prompt.
+- Priorität in der Laufzeit: verifizieren, eingrenzen, dann handeln.
 
-        prompt = f"""
-{self.system_prompt}
-
-
-
-REGELN FÜR WAHRHEIT:
-
-- Du darfst keine Zusammenfassungen geben, ohne vorher Tools benutzt zu haben.
-- Jede technische Aussage muss auf einem Tool-Ergebnis basieren.
-- Wenn kein Tool genutzt wurde → darfst du KEINE finale Bewertung geben.
-- Wenn du unsicher bist → sag explizit "nicht verifiziert".
-- Bevor du optimierst:
-  1. prüfe mit Tools
-  2. analysiere Output
-  3. entscheide dann
-
-VERBOTEN:
-- erfundene Technologien
-- erfundene Tests
-- erfundene Deployments
-- erfundene Prozentzahlen
-
-WICHTIG:
-- Erfinde niemals Technologien, Dateien, Tests, Datenbanken oder Ergebnisse.
-- Behaupte nur etwas, wenn es durch echten Code, echte Logs oder echte Tool-Ergebnisse belegt ist.
-- Wenn du etwas nicht geprüft hast, sage klar: "nicht verifiziert".
+WAHRHEITSREGELN:
+- Keine finale technische Bewertung ohne Tool-Ergebnis, Code, Logs oder klar benannten Ist-Zustand.
+- Wenn etwas nicht geprüft wurde, sage explizit: nicht verifiziert.
+- Erfinde keine Technologien, Dateien, Tests, Deployments oder Prozentwerte.
 - Wenn ein Tool sinnvoll ist, benutze es zuerst.
-- Gib keine erfundenen Prozentwerte für Tests oder Deployment-Status an.
-- Antworte faktenbasiert, nicht fantasiebasiert.
-- Wenn du optimierst, beschreibe nur reale Schritte, die du tatsächlich geprüft oder ausgeführt hast.
+- Beschreibe Optimierungen nur dann als erledigt, wenn sie wirklich geprüft oder ausgeführt wurden.
 
-
-TOOLS DIE DU NUTZEN KANNST:
+TOOLS:
 - linter <repo>
 - build <repo>
 - test <repo>
@@ -352,35 +328,121 @@ TOOLS DIE DU NUTZEN KANNST:
 - supabase_tables
 - elevenlabs_agent <agent_id>
 
-WENN DU EIN TOOL VERWENDEN WILLST, NUTZE EXAKT DIESES FORMAT:
-
+TOOL-FORMAT:
 ```tool
 tool_name
 param1
 param2
 ```
 
+AUSGABESTIL:
+- Denke wie ein Senior Engineer / CTO.
+- Arbeite schrittweise, ruhig und operativ.
+- Nenne Risiken, Grenzen und offene Punkte klar.
+- Bevorzuge konkrete nächste Schritte statt allgemeiner Theorie.
+""".strip()
+
+        self.task_overlays = {
+            "general": """
+ALLGEMEINER OVERLAY:
+- Halte die Antwort fokussiert und auf den nächsten operativen Hebel gerichtet.
+- Wenn keine Tool-Nutzung nötig ist, bleibe klar über den unverifizierten Status.
+""".strip(),
+            "repo_investigation": """
+REPO-TRIAGE OVERLAY:
+- Arbeite repo-bewusst.
+- Bevorzuge Lint-, Build-, Test- und Log-Signale vor Vermutungen.
+- Achte auf Breaking Changes, Runtime-Risiken und Deployment-Folgen.
+""".strip(),
+            "incident": """
+INCIDENT OVERLAY:
+- Denke in Priorität, Severity, Scope, Checks und nächster Operator-Aktion.
+- Bevorzuge schnelle Eingrenzung, klare Hypothesen und risikoarme nächste Schritte.
+""".strip(),
+            "control_center": """
+CONTROL-CENTER OVERLAY:
+- Denke in Dashboard, Operator-Workflow, Handoff und Monitoring-Sicht.
+- Halte die Grenze zwischen efro-control-center und efro-agent bewusst sauber.
+""".strip(),
+        }
+
+    def detect_overlay(self, user_input: str) -> str:
+        text = user_input.lower()
+
+        if any(keyword in text for keyword in ["incident", "alert", "severity", "priority", "watchdog", "playbook"]):
+            return "incident"
+
+        if any(keyword in text for keyword in ["control center", "dashboard", "handoff", "operator", "shop status"]):
+            return "control_center"
+
+        if any(repo_key in text for repo_key in REPO_PATHS) or any(keyword in text for keyword in ["repo", "build", "lint", "test", "bug", "deploy"]):
+            return "repo_investigation"
+
+        return "general"
+
+    def format_extra_context(self, extra_context=None):
+        if not extra_context:
+            return "Kein zusätzlicher Tool-Kontext."
+
+        if isinstance(extra_context, list):
+            formatted_parts = []
+            for item in extra_context[-8:]:
+                if isinstance(item, tuple) and len(item) == 2:
+                    role, content = item
+                    formatted_parts.append(f"{role}: {content}")
+                else:
+                    formatted_parts.append(str(item))
+            return "\n\n".join(formatted_parts)
+
+        return str(extra_context)
+
+    def format_memory(self):
+        recent_memory = self.memory[-5:]
+        if not recent_memory:
+            return "Kein relevanter Verlauf."
+
+        return "\n\n".join(
+            [f"Nutzer: {u}\nAssistent: {a}" for u, a in recent_memory]
+        )
+
+    def build_prompt(self, user_input, extra_context=None):
+        context = "Kein Kontext (Chroma deaktiviert für Speed)."
+        overlay_name = self.detect_overlay(user_input)
+        overlay = self.task_overlays.get(overlay_name, self.task_overlays["general"])
+        repo_mentions = [repo_key for repo_key in REPO_PATHS if repo_key in user_input.lower()]
+        repo_context = ", ".join(repo_mentions) if repo_mentions else "keine explizite Repo-Nennung"
+        extra = self.format_extra_context(extra_context)
+
+        return f"""
+{self.system_prompt}
+
+{self.runtime_prompt}
+
+TASK-OVERLAY ({overlay_name}):
+{overlay}
+
 SYSTEM-ZUSTAND:
 - Ziel: EFRO Projekt stabil + deployfähig + fehlerfrei
 - Fokus: keine Fehler, keine Breaking Changes, produktionsreif
+- Repo-Kontext: {repo_context}
 
 KONTEXT:
 {context}
 
 VERLAUF:
 {self.format_memory()}
+
+ZUSÄTZLICHER KONTEXT:
 {extra}
 
 USER:
 {user_input}
 
-WICHTIG:
-- Wenn ein Tool sinnvoll ist, benutze es direkt
-- Wenn mehrere Schritte nötig sind, führe sie logisch aus
-- Denke wie ein Senior Engineer / CTO
-
 ANTWORT:
 """
+
+    def query(self, user_input, extra_context=None):
+        prompt = self.build_prompt(user_input, extra_context=extra_context)
 
         response = ollama.chat(
             model="qwen2.5-coder:7b",
@@ -389,11 +451,6 @@ ANTWORT:
         reply = response["message"]["content"]
         self.memory.append((user_input, reply))
         return reply
-
-    def format_memory(self):
-        return "\n".join(
-            [f"Nutzer: {u}\nAssistent: {a}" for u, a in self.memory[-5:]]
-        )
 
 
 agent = EfroAgent()
