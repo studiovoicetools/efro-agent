@@ -3,9 +3,10 @@ import subprocess
 import json
 import ollama
 import re
+from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import chromadb
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
@@ -40,6 +41,7 @@ REPO_PATHS = {
     "widget": "/opt/efro-agent/repos/efro-widget",
     "shopify": "/opt/efro-agent/repos/efro-shopify"
 }
+HANDOFF_DIR = os.getenv("EFRO_AGENT_HANDOFF_DIR", "/opt/efro-agent/handoffs")
 # -----------------------------------
 
 # --- Embedding-Funktion (lokal) ---
@@ -174,6 +176,66 @@ def read_file(path):
             return f.read()
     except Exception as e:
         return f"Fehler beim Lesen: {e}"
+
+
+class HandoffPacket(BaseModel):
+    incident_id: str
+    shop_domain: str
+    priority: str
+    severity: str
+    scope: str
+    likely_repo: str
+    likely_subsystem: str
+    summary: str
+    top_findings: list[str] = Field(default_factory=list)
+    checks_run: list[str] = Field(default_factory=list)
+    recommended_next_action: str
+
+
+class HandoffRecord(HandoffPacket):
+    handoff_id: str
+    created_at: str
+
+
+class HandoffCreateResponse(BaseModel):
+    handoff_id: str
+    handoff_path: str
+    packet: HandoffRecord
+
+
+def _ensure_handoff_dir():
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+
+
+def _handoff_file_path(handoff_id: str) -> str:
+    safe_handoff_id = re.sub(r"[^a-zA-Z0-9_-]", "", handoff_id)
+    return os.path.join(HANDOFF_DIR, f"{safe_handoff_id}.json")
+
+
+def create_handoff_record(packet: HandoffPacket) -> HandoffRecord:
+    _ensure_handoff_dir()
+    handoff_id = f"handoff_{uuid4().hex[:12]}"
+    record = HandoffRecord(
+        handoff_id=handoff_id,
+        created_at=datetime.now().isoformat(),
+        **packet.model_dump(),
+    )
+
+    with open(_handoff_file_path(handoff_id), "w", encoding="utf-8") as f:
+        json.dump(record.model_dump(), f, ensure_ascii=False, indent=2)
+
+    return record
+
+
+def load_handoff_record(handoff_id: str) -> HandoffRecord:
+    path = _handoff_file_path(handoff_id)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Handoff nicht gefunden")
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    return HandoffRecord(**payload)
         
 # --- Vercel API (Logs, Deployments) ---
 
@@ -459,6 +521,25 @@ agent = EfroAgent()
 class ToolRequest(BaseModel):
     tool: str
     params: list[str]
+
+
+@app.post("/handoff", response_model=HandoffCreateResponse)
+async def create_handoff(packet: HandoffPacket):
+    record = create_handoff_record(packet)
+    log_message(f"HANDOFF_CREATE handoff_id={record.handoff_id} incident_id={record.incident_id} repo={record.likely_repo}")
+    return {
+        "handoff_id": record.handoff_id,
+        "handoff_path": f"/handoff/{record.handoff_id}",
+        "packet": record.model_dump(),
+    }
+
+
+@app.get("/api/handoff/{handoff_id}")
+async def get_handoff(handoff_id: str):
+    record = load_handoff_record(handoff_id)
+    log_message(f"HANDOFF_LOAD handoff_id={record.handoff_id} incident_id={record.incident_id}")
+    return record.model_dump()
+
 
 @app.post("/tool")
 async def call_tool(req: ToolRequest):
@@ -820,7 +901,8 @@ async def health():
     }
 
 @app.get("/")
-async def root():
+@app.get("/handoff/{handoff_id}")
+async def root(handoff_id: Optional[str] = None):
     html = '''<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -1125,7 +1207,7 @@ async def root():
         }
     </style>
 </head>
-<body>
+<body data-handoff-id="__HANDOFF_ID__">
 <div class="app-shell">
     <header class="topbar">
         <div class="title-wrap">
@@ -1134,6 +1216,7 @@ async def root():
         </div>
         <div class="status-cluster">
             <div id="status" class="status-badge ready">Bereit</div>
+            <div id="handoff-pill" class="meta-pill" style="display:none;"></div>
             <div class="meta-pill">UI Fokus: ruhig, lesbar, operativ</div>
         </div>
     </header>
@@ -1212,9 +1295,37 @@ document.addEventListener('DOMContentLoaded', () => {
     const autoscrollToggle = document.getElementById('autoscroll-toggle');
     const pauseLogsToggle = document.getElementById('pause-logs-toggle');
     const logMeta = document.getElementById('log-meta');
+    const handoffId = document.body.dataset.handoffId;
+    const handoffPill = document.getElementById('handoff-pill');
 
     let terminalInitialized = false;
     let lastRenderedLineCount = 0;
+
+    async function loadHandoffContext() {
+        if (!handoffId) return;
+
+        try {
+            const resp = await fetch(`/api/handoff/${encodeURIComponent(handoffId)}`);
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+
+            const packet = await resp.json();
+            handoffPill.style.display = 'inline-flex';
+            handoffPill.innerText = `Handoff · ${packet.handoff_id}`;
+
+            clearEmptyState(messagesDiv);
+            addMessage('system', `Handoff geladen\n\nIncident: ${packet.incident_id}\nShop: ${packet.shop_domain}\nPriorität: ${packet.priority}\nSeverity: ${packet.severity}\nScope: ${packet.scope}\nRepo: ${packet.likely_repo}\nSubsystem: ${packet.likely_subsystem}`);
+            addMessage('assistant', `Zusammenfassung:\n${packet.summary}\n\nTop Findings:\n- ${(packet.top_findings || []).join('\n- ') || 'Keine Angaben'}\n\nChecks Run:\n- ${(packet.checks_run || []).join('\n- ') || 'Keine Angaben'}\n\nNächste empfohlene Aktion:\n${packet.recommended_next_action}`);
+            messageInput.value = `Untersuche Handoff ${packet.handoff_id} für ${packet.shop_domain} im Repo ${packet.likely_repo}. Starte mit einer verifizierten Triage.`;
+            setStatus('ready', 'Handoff geladen');
+        } catch (err) {
+            handoffPill.style.display = 'inline-flex';
+            handoffPill.innerText = `Handoff Fehler`;
+            addMessage('system', `Handoff konnte nicht geladen werden: ${err.message}`);
+            setStatus('error', 'Handoff Fehler');
+        }
+    }
 
     function setStatus(state, label) {
         statusDiv.className = `status-badge ${state}`;
@@ -1373,10 +1484,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setInterval(() => fetchLogs(false), 2000);
     fetchLogs(true);
+    loadHandoffContext();
 });
 </script>
 </body>
 </html>'''
+    html = html.replace("__HANDOFF_ID__", handoff_id or "")
     return HTMLResponse(content=html)
 
 if __name__ == "__main__":
