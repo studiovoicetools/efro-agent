@@ -135,8 +135,33 @@ def deterministic_optimize(repo_key):
 
 def parse_direct_command(message: str):
     text = message.strip().lower()
+    if not text:
+        return None
+
     if text in ("status", "agent status"):
         return ("status", None)
+
+    if text in ("smoke shopify", "smoke_shopify"):
+        return ("smoke_shopify", "shopify")
+
+    parts = text.split()
+    if len(parts) >= 2:
+        command = parts[0]
+        repo = parts[1]
+
+        command_aliases = {
+            "lint": "linter",
+            "linter": "linter",
+            "build": "build",
+            "test": "test",
+            "install": "install",
+            "optimize": "optimize",
+        }
+
+        normalized_command = command_aliases.get(command)
+        if normalized_command and repo in REPO_PATHS:
+            return (normalized_command, repo)
+
     return None
 
 
@@ -159,10 +184,16 @@ def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
         "Content-Type": "application/json"
     }
     url = f"https://api.vercel.com/{endpoint}"
+
     if method != "GET":
         return "DISABLED: non-read Vercel requests removed"
-    resp = requests.get(url, headers=headers)
-    return resp.text
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.RequestException as e:
+        return f"Fehler bei Vercel-API: {e}"
 
 def get_vercel_logs(project_id: str):
     """Ruft die letzten Deployment-Logs von Vercel ab (verwendet globalen VERCEL_TOKEN)."""
@@ -188,10 +219,16 @@ def render_request(endpoint: str, api_token: str, method="GET", data=None):
         "Content-Type": "application/json"
     }
     url = f"https://api.render.com/{endpoint}"
+
     if method != "GET":
         return "DISABLED: non-read Render requests removed"
-    resp = requests.get(url, headers=headers)
-    return resp.text
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.RequestException as e:
+        return f"Fehler bei Render-API: {e}"
 
 def get_render_logs(service_id: str):
     """Ruft die Logs eines Render-Service ab (verwendet globalen RENDER_TOKEN)."""
@@ -699,51 +736,6 @@ Antwort nur als ```file Blöcke.
 
 
 
-## 5. **Fehlerbehandlung in den API-Request-Funktionen**  
-##Problem: Bei Netzwerkfehlern könnten Exceptions auftreten.  
-##Lösung: Ersetze die Funktionen `vercel_request` und `render_request` durch robuste Versionen mit `try/except`.
-
-### Einfügen: Ersetze die beiden Funktionen.
-
-#python
-def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
-    import requests
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    url = f"https://api.vercel.com/{endpoint}"
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            resp = requests.post(url, headers=headers, json=data, timeout=30)
-        else:
-            return "Unsupported method"
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.RequestException as e:
-        return f"Fehler bei Vercel-API: {e}"
-def render_request(endpoint: str, api_token: str, method="GET", data=None):
-    import requests
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    url = f"https://api.render.com/{endpoint}"
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            resp = requests.post(url, headers=headers, json=data, timeout=30)
-        else:
-            return "Unsupported method"
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.RequestException as e:
-        return f"Fehler bei Render-API: {e}"        
-
-    
 @app.get("/log")
 async def get_log():
     try:
@@ -761,6 +753,14 @@ async def get_log():
             "lines": [],
             "total_lines": 0
         }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "efro-agent",
+        "time": datetime.now().isoformat()
+    }
 
 @app.get("/")
 async def root():
@@ -1324,4 +1324,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    host = os.getenv("EFRO_AGENT_HOST", "127.0.0.1")
+    port = int(os.getenv("EFRO_AGENT_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)
