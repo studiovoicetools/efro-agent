@@ -1690,6 +1690,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     setInterval(() => fetchLogs(false), 2000);
+    setInterval(() => loadRecentHandoffs(), 15000);
     fetchLogs(true);
     loadRecentHandoffs();
     loadHandoffContext();
