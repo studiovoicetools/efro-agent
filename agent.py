@@ -962,17 +962,17 @@ async def root(handoff_id: Optional[str] = None):
         :root {
             color-scheme: dark;
             --bg: #0b1020;
-            --panel: #121a2b;
-            --panel-2: #182236;
-            --panel-3: #0f1728;
-            --border: #26324d;
-            --text: #eef2ff;
-            --muted: #9ca8c3;
-            --accent: #7c9cff;
+            --panel: #121934;
+            --panel-2: #172040;
+            --panel-3: #1e2748;
+            --border: #283355;
+            --text: #e8ecf8;
+            --muted: #9ca9cf;
+            --accent: #87b3ff;
             --accent-2: #3dd9b0;
-            --danger: #ff6b7a;
-            --warning: #ffb454;
-            --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+            --danger: #d64545;
+            --warning: #d9822b;
+            --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
         }
 
         * { box-sizing: border-box; }
@@ -980,7 +980,7 @@ async def root(handoff_id: Optional[str] = None):
         body {
             margin: 0;
             font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            background: linear-gradient(180deg, #0a0f1d 0%, #0e1528 100%);
+            background: linear-gradient(180deg, #0b1020 0%, #0d1327 100%);
             color: var(--text);
         }
 
