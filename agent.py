@@ -1288,13 +1288,13 @@ async def root(handoff_id: Optional[str] = None):
         }
 
         .handoff-item:hover {
-            border-color: rgba(135, 179, 255, 0.30);
-            transform: translateY(-1px);
+            border-color: rgba(135, 179, 255, 0.24);
+            transform: none;
         }
 
         .handoff-item.active {
-            border-color: rgba(61, 217, 176, 0.32);
-            box-shadow: inset 0 0 0 1px rgba(61, 217, 176, 0.14);
+            border-color: rgba(61, 217, 176, 0.28);
+            box-shadow: inset 0 0 0 1px rgba(61, 217, 176, 0.12);
         }
 
         .handoff-item-header {
