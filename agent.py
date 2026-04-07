@@ -503,8 +503,8 @@ TASK-OVERLAY ({overlay_name}):
 {overlay}
 
 SYSTEM-ZUSTAND:
-- Ziel: EFRO Projekt stabil + deployfähig + fehlerfrei
-- Fokus: keine Fehler, keine Breaking Changes, produktionsreif
+- Ziel: Probleme sicher analysieren, Belege sammeln und verständliche Incident-Reports schreiben
+- Fokus: read-only, faktenbasiert, keine Änderungen, keine Optimierung
 - Repo-Kontext: {repo_context}
 
 KONTEXT:
@@ -601,13 +601,8 @@ async def call_tool(req: ToolRequest):
         log_message(f"Tool test repo={repo} -> {output[:200]}")
         return {"output": output}
     elif req.tool == "write_file":
-        if len(req.params) < 2:
-            return {"error": "Bitte Pfad und Inhalt angeben"}
-        path = req.params[0]
-        content = " ".join(req.params[1:])
-        result = write_file(path, content)
-        log_message(f"Tool write_file path={path} -> {result[:200]}")
-        return {"output": result}
+        log_message("Tool write_file -> blocked in read-only reporter mode")
+        return {"error": "write_file ist deaktiviert. Dieser Agent arbeitet im read-only Incident-Reporter-Modus."}
     elif req.tool == "read_file":
         if not req.params:
             return {"error": "Bitte Pfad angeben"}
