@@ -1194,6 +1194,7 @@ async def root(handoff_id: Optional[str] = None):
             align-items: center;
             gap: 12px;
             flex-wrap: wrap;
+            background: rgba(30, 39, 72, 0.32);
         }
 
         .terminal-controls,
@@ -1217,7 +1218,7 @@ async def root(handoff_id: Optional[str] = None):
             min-height: 0;
             overflow-y: auto;
             padding: 16px 18px 20px;
-            background: #0a1020;
+            background: rgba(11, 16, 32, 0.72);
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             font-size: 12px;
             line-height: 1.5;
@@ -1245,7 +1246,7 @@ async def root(handoff_id: Optional[str] = None):
             display: grid;
             grid-template-columns: minmax(0, 1fr) auto auto;
             gap: 10px;
-            background: rgba(15, 23, 40, 0.9);
+            background: rgba(30, 39, 72, 0.45);
         }
 
         .empty-state {
@@ -1258,7 +1259,7 @@ async def root(handoff_id: Optional[str] = None):
             padding: 14px;
             border: 1px solid var(--border);
             border-radius: 16px;
-            background: rgba(15, 23, 40, 0.72);
+            background: rgba(18, 25, 52, 0.58);
             display: flex;
             flex-direction: column;
             gap: 10px;
@@ -1279,7 +1280,7 @@ async def root(handoff_id: Optional[str] = None):
         .handoff-item {
             border: 1px solid var(--border);
             border-radius: 14px;
-            background: rgba(11, 16, 32, 0.82);
+            background: rgba(11, 16, 32, 0.68);
             padding: 12px;
             text-decoration: none;
             color: var(--text);
@@ -1287,13 +1288,13 @@ async def root(handoff_id: Optional[str] = None):
         }
 
         .handoff-item:hover {
-            border-color: rgba(124, 156, 255, 0.45);
+            border-color: rgba(135, 179, 255, 0.30);
             transform: translateY(-1px);
         }
 
         .handoff-item.active {
-            border-color: rgba(61, 217, 176, 0.45);
-            box-shadow: inset 0 0 0 1px rgba(61, 217, 176, 0.18);
+            border-color: rgba(61, 217, 176, 0.32);
+            box-shadow: inset 0 0 0 1px rgba(61, 217, 176, 0.14);
         }
 
         .handoff-item-header {
