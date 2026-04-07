@@ -726,17 +726,10 @@ async def chat(req: ChatRequest):
             }
 
         if command == "install":
-            output = run_install(repo)
-            log_message(f"DIRECT install repo={repo} -> {output[:300]}")
+            log_message(f"DIRECT install repo={repo} -> blocked in read-only reporter mode")
             return {
-                "reply": f"Direktbefehl ausgeführt: install {repo}",
-                "tool_results": [
-                    {
-                        "tool": "install",
-                        "params": [repo],
-                        "output": output
-                    }
-                ]
+                "reply": "Install ist deaktiviert. Dieser Agent arbeitet als read-only Incident-Reporter und führt keine Änderungen aus.",
+                "tool_results": []
             }
 
         if command == "smoke_shopify":
