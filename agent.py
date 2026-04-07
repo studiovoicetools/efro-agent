@@ -1194,7 +1194,7 @@ async def root(handoff_id: Optional[str] = None):
             align-items: center;
             gap: 12px;
             flex-wrap: wrap;
-            background: rgba(30, 39, 72, 0.32);
+            background: rgba(30, 39, 72, 0.24);
         }
 
         .terminal-controls,
