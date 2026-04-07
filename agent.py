@@ -403,7 +403,6 @@ TOOLS:
 - linter <repo>
 - build <repo>
 - test <repo>
-- write_file <path> <content>
 - read_file <path>
 - vercel_logs <project_id>
 - render_logs <service_id>
@@ -685,7 +684,7 @@ async def chat(req: ChatRequest):
 
         if command == "status":
             return {
-                "reply": "Agent läuft. Direkte Befehle: linter <repo>, build <repo>, test <repo>, install <repo>, optimize <repo>",
+                "reply": "Agent läuft im read-only Incident-Reporter-Modus. Er sammelt Belege und schreibt Berichte, führt aber keine Optimierungen aus.",
                 "tool_results": []
             }
 
@@ -760,16 +759,10 @@ async def chat(req: ChatRequest):
             }    
 
         if command == "optimize":
-            result = deterministic_optimize(repo)
-            summary = []
-            for step in result["steps"]:
-                first_line = step["output"].strip().splitlines()[0] if step["output"].strip() else "Keine Ausgabe"
-                summary.append(f"{step['tool']} {repo}: {first_line}")
-
-            log_message(f"DIRECT optimize repo={repo} -> {' | '.join(summary)[:500]}")
+            log_message(f"DIRECT optimize repo={repo} -> disabled in read-only reporter mode")
             return {
-                "reply": "Deterministische Optimierung abgeschlossen:\n" + "\n".join(summary),
-                "tool_results": result["steps"]
+                "reply": "Optimize ist deaktiviert. Dieser Agent arbeitet als read-only Incident-Reporter und schreibt Berichte statt Änderungen auszuführen.",
+                "tool_results": []
             }
 
     # -------- FALLBACK: LLM MODE --------
@@ -815,7 +808,7 @@ async def chat(req: ChatRequest):
         current_input = "Die folgenden Tools wurden ausgeführt und haben diese Ergebnisse geliefert:\n"
         for tr in tool_results:
             current_input += f"\nTool: {tr['tool']} {tr['params']}\nOutput:\n{tr['output']}\n"
-        current_input += "\nBitte fahre mit der Optimierung fort oder gib eine Antwort."
+        current_input += "\nBitte schreibe jetzt einen strukturierten Incident-Report auf Basis der verifizierten Tool-Ergebnisse. Keine Optimierung, keine Änderungen, markiere Unsicherheit klar als nicht verifiziert."
 
     return {
         "reply": reply,
@@ -841,12 +834,9 @@ class OptimizeRequest(BaseModel):
 
 @app.post("/optimize")
 async def optimize(req: OptimizeRequest):
-    repo = req.repo
-    max_iter = req.max_iterations
-    cwd = REPO_PATHS.get(repo)
-
-    if not cwd:
-        return {"error": f"Repo '{repo}' nicht bekannt."}
+    return {
+        "warning": "Optimize ist deaktiviert. Dieser Agent arbeitet als read-only Incident-Reporter und schreibt Berichte statt Änderungen auszuführen."
+    }
 
     results = {
         "linter": {"success": False, "iterations": 0, "log": ""},
