@@ -1047,8 +1047,8 @@ async def root(handoff_id: Optional[str] = None):
         .panel {
             min-height: 0;
             border: 1px solid var(--border);
-            border-radius: 20px;
-            background: rgba(18, 26, 43, 0.94);
+            border-radius: 16px;
+            background: rgba(18, 25, 52, 0.92);
             box-shadow: var(--shadow);
             display: flex;
             flex-direction: column;
@@ -1056,17 +1056,17 @@ async def root(handoff_id: Optional[str] = None):
         }
 
         .panel-header {
-            padding: 18px 20px 14px;
+            padding: 16px 18px 12px;
             border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 16px;
+            gap: 14px;
         }
 
         .panel-title {
             margin: 0;
-            font-size: 16px;
+            font-size: 15px;
         }
 
         .panel-subtitle {
@@ -1082,13 +1082,13 @@ async def root(handoff_id: Optional[str] = None):
             padding: 18px;
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 10px;
         }
 
         .message {
-            max-width: 92%;
+            max-width: 90%;
             padding: 12px 14px;
-            border-radius: 16px;
+            border-radius: 14px;
             line-height: 1.45;
             white-space: pre-wrap;
             word-break: break-word;
@@ -1097,38 +1097,40 @@ async def root(handoff_id: Optional[str] = None):
 
         .message.user {
             align-self: flex-end;
-            background: linear-gradient(135deg, #6f8fff, #5575ff);
-            color: white;
+            background: rgba(135, 179, 255, 0.14);
+            border-color: rgba(135, 179, 255, 0.26);
+            color: #eaf1ff;
         }
 
         .message.assistant {
             align-self: flex-start;
-            background: #eef2ff;
-            color: #101828;
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--border);
+            color: var(--text);
         }
 
         .message.tool {
             align-self: flex-start;
-            background: rgba(61, 217, 176, 0.12);
-            border-color: rgba(61, 217, 176, 0.22);
+            background: rgba(61, 217, 176, 0.10);
+            border-color: rgba(61, 217, 176, 0.20);
             color: #d8fff4;
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         }
 
         .message.system {
             align-self: flex-start;
-            background: rgba(255, 180, 84, 0.12);
-            border-color: rgba(255, 180, 84, 0.22);
+            background: rgba(217, 130, 43, 0.10);
+            border-color: rgba(217, 130, 43, 0.20);
             color: #ffe7c2;
         }
 
         .composer {
             border-top: 1px solid var(--border);
-            padding: 16px 18px 18px;
+            padding: 14px 16px 16px;
             display: flex;
             gap: 12px;
             align-items: center;
-            background: rgba(15, 23, 40, 0.9);
+            background: rgba(30, 39, 72, 0.45);
         }
 
         .text-input,
@@ -1163,12 +1165,14 @@ async def root(handoff_id: Optional[str] = None):
 
         button:hover {
             transform: translateY(-1px);
-            border-color: rgba(124, 156, 255, 0.4);
+            border-color: rgba(135, 179, 255, 0.35);
+            background: rgba(255, 255, 255, 0.04);
         }
 
         button.primary {
-            background: linear-gradient(135deg, #6d8dff, #4d6fff);
-            border-color: rgba(124, 156, 255, 0.45);
+            background: rgba(135, 179, 255, 0.12);
+            border-color: rgba(135, 179, 255, 0.24);
+            color: #dce8ff;
         }
 
         button.ghost {
