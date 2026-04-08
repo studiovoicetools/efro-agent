@@ -1360,7 +1360,7 @@ async def root(handoff_id: Optional[str] = None):
                 </div>
             </div>
             <div id="messages" class="messages">
-                <div class="empty-state">Noch keine Unterhaltung. Starte mit einer Nachricht oder einem direkten Repo-Befehl.</div>
+                <div class="empty-state">Noch keine Unterhaltung. Starte mit einer Nachricht, prüfe Handoffs oder nutze rechts einen direkten Repo-Befehl für eine technische Sichtung.</div>
             </div>
             <div class="composer">
                 <input type="text" id="message-input" class="text-input" placeholder="Nachricht an den Agenten...">
