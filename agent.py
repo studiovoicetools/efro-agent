@@ -996,11 +996,11 @@ async def root(handoff_id: Optional[str] = None):
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 16px;
-            padding: 18px 20px;
+            gap: 14px;
+            padding: 16px 18px;
             border: 1px solid var(--border);
-            border-radius: 18px;
-            background: rgba(18, 26, 43, 0.92);
+            border-radius: 16px;
+            background: rgba(18, 25, 52, 0.9);
             box-shadow: var(--shadow);
         }
 
