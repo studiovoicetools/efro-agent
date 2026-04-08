@@ -1056,17 +1056,17 @@ async def root(handoff_id: Optional[str] = None):
         }
 
         .panel-header {
-            padding: 16px 18px 12px;
+            padding: 14px 16px 12px;
             border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 14px;
+            gap: 12px;
         }
 
         .panel-title {
             margin: 0;
-            font-size: 15px;
+            font-size: 14px;
         }
 
         .panel-subtitle {
