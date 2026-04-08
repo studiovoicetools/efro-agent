@@ -647,9 +647,17 @@ class ChatRequest(BaseModel):
     message: str
     handoff_id: Optional[str] = None
 
+@app.post("/api/chat")
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    user_input = req.message.strip()
+    user_input = (
+        getattr(req, "message", None)
+        or getattr(req, "prompt", None)
+        or getattr(req, "text", None)
+        or ""
+    ).strip()
+    if not user_input:
+        return {"reply": "", "message": "", "tool_results": [], "ok": False, "error": "Leere Nachricht"}
     handoff_context = None
 
     if req.handoff_id:
@@ -804,12 +812,25 @@ async def chat(req: ChatRequest):
         "warning": "Maximale Anzahl Tool-Aufrufe erreicht."
     }
 
-@app.get("/terminal")
-async def terminal(cmd: str, repo: str = "brain"):
-    cwd = REPO_PATHS.get(repo, REPO_PATHS["brain"])
-    output = run_command(cmd, cwd)
-    log_message(f"TERMINAL: {repo} $ {cmd} -> {output[:200]}")
-    return {"output": output}
+class TerminalRequest(BaseModel):
+    cmd: Optional[str] = None
+    command: Optional[str] = None
+    repo: Optional[str] = None
+
+@app.api_route("/api/terminal", methods=["GET", "POST"])
+@app.api_route("/command", methods=["GET", "POST"])
+@app.api_route("/terminal", methods=["GET", "POST"])
+async def terminal(cmd: Optional[str] = None, repo: str = "brain", req: Optional[TerminalRequest] = None):
+    effective_cmd = (cmd or (req.cmd if req else None) or (req.command if req else None) or "").strip()
+    effective_repo = (((req.repo if req else None) or repo) or "brain").strip()
+    cwd = REPO_PATHS.get(effective_repo, REPO_PATHS["brain"])
+
+    if not effective_cmd:
+        return {"output": "", "reply": "Kein Befehl übergeben", "ok": False, "repo": effective_repo}
+
+    output = run_command(effective_cmd, cwd)
+    log_message(f"TERMINAL: {effective_repo} $ {effective_cmd} -> {output[:200]}")
+    return {"output": output, "reply": output, "log": output, "ok": True, "repo": effective_repo, "cmd": effective_cmd}
 
 
 class OptimizeRequest(BaseModel):
@@ -914,6 +935,8 @@ Antwort nur als ```file Blöcke.
 
 
 
+@app.get("/api/log")
+@app.get("/logs")
 @app.get("/log")
 async def get_log():
     try:
