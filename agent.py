@@ -1243,10 +1243,10 @@ async def root(handoff_id: Optional[str] = None):
 
         .terminal-footer {
             border-top: 1px solid var(--border);
-            padding: 16px 18px 18px;
+            padding: 14px 16px 16px;
             display: grid;
             grid-template-columns: minmax(0, 1fr) auto auto;
-            gap: 10px;
+            gap: 9px;
             background: rgba(30, 39, 72, 0.45);
         }
 
