@@ -937,6 +937,7 @@ Antwort nur als ```file Blöcke.
 
 
 
+@app.get("/api/logs")
 @app.get("/api/log")
 @app.get("/logs")
 @app.get("/log")
