@@ -1127,9 +1127,9 @@ async def root(handoff_id: Optional[str] = None):
 
         .composer {
             border-top: 1px solid var(--border);
-            padding: 14px 16px 16px;
+            padding: 13px 15px 15px;
             display: flex;
-            gap: 12px;
+            gap: 10px;
             align-items: center;
             background: rgba(30, 39, 72, 0.45);
         }
