@@ -1080,10 +1080,10 @@ async def root(handoff_id: Optional[str] = None):
             flex: 1;
             min-height: 0;
             overflow-y: auto;
-            padding: 18px;
+            padding: 16px;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 9px;
         }
 
         .message {
