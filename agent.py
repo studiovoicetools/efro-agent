@@ -644,7 +644,9 @@ async def call_tool(req: ToolRequest):
 
 # --- Chat-Endpunkt ---
 class ChatRequest(BaseModel):
-    message: str
+    message: Optional[str] = None
+    prompt: Optional[str] = None
+    text: Optional[str] = None
     handoff_id: Optional[str] = None
 
 @app.post("/api/chat")
