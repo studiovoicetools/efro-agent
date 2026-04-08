@@ -1020,7 +1020,7 @@ async def root(handoff_id: Optional[str] = None):
         .status-cluster {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
             flex-wrap: wrap;
         }
 
@@ -1029,7 +1029,7 @@ async def root(handoff_id: Optional[str] = None):
             border: 1px solid var(--border);
             background: var(--panel-3);
             border-radius: 999px;
-            padding: 8px 12px;
+            padding: 7px 11px;
             font-size: 12px;
             color: var(--muted);
         }
