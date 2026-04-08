@@ -1006,14 +1006,15 @@ async def root(handoff_id: Optional[str] = None):
 
         .title-wrap h1 {
             margin: 0;
-            font-size: 22px;
-            line-height: 1.2;
+            font-size: 20px;
+            line-height: 1.15;
         }
 
         .title-wrap p {
             margin: 6px 0 0;
             color: var(--muted);
             font-size: 13px;
+            max-width: 760px;
         }
 
         .status-cluster {
