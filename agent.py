@@ -779,7 +779,7 @@ async def chat(req: ChatRequest):
         matches = re.findall(tool_pattern, reply, re.DOTALL)
 
         if not matches:
-            return {"reply": reply, "tool_results": []}
+            return {"reply": reply, "message": reply, "content": reply, "tool_results": [], "ok": True}
 
         tool_results = []
         for match in matches:
