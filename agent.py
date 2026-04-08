@@ -1041,8 +1041,8 @@ async def root(handoff_id: Optional[str] = None):
         .main-grid {
             min-height: 0;
             display: grid;
-            grid-template-columns: minmax(420px, 1.25fr) minmax(360px, 0.75fr);
-            gap: 18px;
+            grid-template-columns: minmax(420px, 1.25fr) minmax(340px, 0.75fr);
+            gap: 16px;
         }
 
         .panel {
