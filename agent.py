@@ -958,6 +958,7 @@ async def get_log():
             "total_lines": 0
         }
 
+@app.get("/api/health")
 @app.get("/health")
 async def health():
     _ensure_handoff_dir()
