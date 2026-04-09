@@ -1551,7 +1551,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             clearEmptyState(messagesDiv);
             addMessage('system', `Handoff geladen\n\nIncident: ${packet.incident_id}\nShop: ${packet.shop_domain}\nPriorität: ${packet.priority}\nSeverity: ${packet.severity}\nScope: ${packet.scope}\nRepo: ${packet.likely_repo}\nSubsystem: ${packet.likely_subsystem}`);
-            addMessage('assistant', `Zusammenfassung:\n${packet.summary}\n\nTop Findings:\n- ${(packet.top_findings || []).join('\n- ') || 'Keine Angaben'}\n\nChecks Run:\n- ${(packet.checks_run || []).join('\n- ') || 'Keine Angaben'}\n\nNächste empfohlene Aktion:\n${packet.recommended_next_action}`);
+            addMessage('assistant', `Zusammenfassung:\n${packet.summary}\n\nTop Findings:\n- ${(packet.top_findings || []).join('\\n- ') || 'Keine Angaben'}\n\nChecks Run:\n- ${(packet.checks_run || []).join('\\n- ') || 'Keine Angaben'}\n\nNächste empfohlene Aktion:\n${packet.recommended_next_action}`);
             messageInput.value = `Untersuche Handoff ${packet.handoff_id} für ${packet.shop_domain} im Repo ${packet.likely_repo}. Starte mit einer verifizierten Triage.`;
             setStatus('ready', 'Handoff geladen');
         } catch (err) {
