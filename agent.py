@@ -14,6 +14,8 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from datetime import datetime   # <-- NEU
 
+import threading
+import time
 load_dotenv()
 
 # --- Logging-Hilfsfunktion ---
@@ -243,7 +245,7 @@ def list_handoff_records(limit: int = 25) -> list[dict[str, Any]]:
     records: list[HandoffRecord] = []
 
     for entry in os.listdir(HANDOFF_DIR):
-        if not entry.endswith('.json'):
+        if not re.fullmatch(r"handoff_[a-zA-Z0-9_-]+\.json", entry):
             continue
 
         path = os.path.join(HANDOFF_DIR, entry)
@@ -257,6 +259,466 @@ def list_handoff_records(limit: int = 25) -> list[dict[str, Any]]:
     records.sort(key=lambda record: record.created_at, reverse=True)
     return [record.model_dump() for record in records[:limit]]
         
+WATCHDOG_LOCK = threading.Lock()
+WATCHDOG_STATE: dict[str, Any] = {
+    "enabled": False,
+    "interval_seconds": 120,
+    "last_run_at": None,
+    "last_results": {},
+    "active_failure_signatures": {},
+    "last_handoff_ids": {},
+    "consecutive_failures": {},
+    "last_ok_at": {},
+    "last_error_at": {},
+    "thread_started": False,
+}
+
+def _watchdog_enabled() -> bool:
+    return os.getenv("EFRO_AGENT_WATCHDOG_ENABLED", "0").strip() == "1"
+
+def _watchdog_interval_seconds() -> int:
+    raw = os.getenv("EFRO_AGENT_WATCHDOG_INTERVAL_SECONDS", "120").strip()
+    try:
+        return max(30, int(raw))
+    except Exception:
+        return 120
+
+def _watchdog_public_failure_threshold() -> int:
+    raw = os.getenv("EFRO_AGENT_PUBLIC_FAILURE_THRESHOLD", "3").strip()
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 3
+
+def _watchdog_now() -> str:
+    return datetime.now().isoformat()
+
+def _clip_text(value: str, limit: int = 240) -> str:
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+def _watchdog_check_result(
+    check_name: str,
+    target: str,
+    status: str,
+    kind: str,
+    evidence: str,
+    expected: str,
+    observed: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    return {
+        "check_name": check_name,
+        "target": target,
+        "status": status,
+        "kind": kind,
+        "evidence": evidence,
+        "expected": expected,
+        "observed": observed,
+        "duration_ms": duration_ms,
+        "timestamp": _watchdog_now(),
+    }
+
+def _run_observation_check(
+    check_name: str,
+    target: str,
+    status: str,
+    kind: str,
+    evidence: str,
+    expected: str,
+    observed: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    return _watchdog_check_result(
+        check_name=check_name,
+        target=target,
+        status=status,
+        kind=kind,
+        evidence=evidence,
+        expected=expected,
+        observed=observed,
+        duration_ms=duration_ms,
+    )
+
+
+def _build_local_health_payload() -> dict[str, Any]:
+    _ensure_handoff_dir()
+    handoff_count = 0
+    for entry in os.listdir(HANDOFF_DIR):
+        if re.fullmatch(r"handoff_[a-zA-Z0-9_-]+\.json", entry):
+            handoff_count += 1
+
+    return {
+        "status": "ok",
+        "service": "efro-agent",
+        "time": _watchdog_now(),
+        "model": os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b"),
+        "handoff_dir": HANDOFF_DIR,
+        "handoff_dir_exists": os.path.isdir(HANDOFF_DIR),
+        "handoff_count": handoff_count,
+        "repos": sorted(REPO_PATHS.keys()),
+    }
+
+
+def _check_local_health_contract() -> dict[str, Any]:
+    started = time.time()
+    try:
+        payload = _build_local_health_payload()
+        ok = payload["status"] == "ok" and payload["handoff_dir_exists"] is True
+        evidence = _clip_text(json.dumps(payload, ensure_ascii=False), 220)
+        return _run_observation_check(
+            check_name="local_health",
+            target="internal:health-payload",
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected="status=ok and handoff_dir_exists=true",
+            observed=f"status={payload['status']}; handoff_dir_exists={payload['handoff_dir_exists']}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="local_health",
+            target="internal:health-payload",
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="status=ok and handoff_dir_exists=true",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_public_health_contract() -> dict[str, Any]:
+    started = time.time()
+    shop_domain = os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com"
+    target = f"https://{shop_domain}/health"
+    expected_contains = '"status":"ok"'
+    cmd = ["curl", "--silent", "--show-error", "--location", "--max-time", "15", target]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        ok = completed.returncode == 0 and expected_contains in stdout
+        evidence = _clip_text(
+            f"returncode={completed.returncode}; stdout={stdout}; stderr={stderr}",
+            220,
+        )
+        return _run_observation_check(
+            check_name="public_health",
+            target=target,
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            observed=f"returncode={completed.returncode}; contains={expected_contains in stdout}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except subprocess.TimeoutExpired as e:
+        return _run_observation_check(
+            check_name="public_health",
+            target=target,
+            status="error",
+            kind="technical",
+            evidence=f"timeout={e}",
+            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            observed=f"timeout={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="public_health",
+            target=target,
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_handoffs_api_contract() -> dict[str, Any]:
+    started = time.time()
+    try:
+        items = list_handoff_records(limit=1)
+        ok = isinstance(items, list)
+        evidence = f"items_count={len(items)}"
+        return _run_observation_check(
+            check_name="handoffs_api",
+            target="internal:list_handoff_records(limit=1)",
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected="list result",
+            observed=f"type={type(items).__name__}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="handoffs_api",
+            target="internal:list_handoff_records(limit=1)",
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="list result",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_chat_status_contract() -> dict[str, Any]:
+    started = time.time()
+    expected_reply = "Agent läuft im read-only Incident-Reporter-Modus. Er sammelt Belege und schreibt Berichte, führt aber keine Optimierungen aus."
+    try:
+        direct = parse_direct_command("status")
+        ok = direct == ("status", None)
+        return _run_observation_check(
+            check_name="chat_status_contract",
+            target="internal:parse_direct_command('status')",
+            status="ok" if ok else "error",
+            kind="answer_contract",
+            evidence=f"direct={direct}; expected_reply={expected_reply}",
+            expected="('status', None) and read-only status contract",
+            observed=f"direct={direct}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="chat_status_contract",
+            target="internal:parse_direct_command('status')",
+            status="error",
+            kind="answer_contract",
+            evidence=f"exception={e}",
+            expected="('status', None) and read-only status contract",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_command_pwd_contract() -> dict[str, Any]:
+    started = time.time()
+    expected_output = "DISABLED: unsafe shell execution removed"
+    try:
+        output = run_command("pwd", REPO_PATHS["brain"])
+        ok = output == expected_output
+        return _run_observation_check(
+            check_name="command_pwd_contract",
+            target="internal:run_command('pwd', REPO_PATHS['brain'])",
+            status="ok" if ok else "error",
+            kind="answer_contract",
+            evidence=f"output={output}",
+            expected=expected_output,
+            observed=output,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="command_pwd_contract",
+            target="internal:run_command('pwd', REPO_PATHS['brain'])",
+            status="error",
+            kind="answer_contract",
+            evidence=f"exception={e}",
+            expected=expected_output,
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _efro_watchdog_checks() -> list[dict[str, Any]]:
+    return [
+        _check_local_health_contract(),
+        _check_public_health_contract(),
+        _check_handoffs_api_contract(),
+        _check_chat_status_contract(),
+        _check_command_pwd_contract(),
+    ]
+
+
+def _watchdog_failure_signature(failed_checks: list[dict[str, Any]]) -> str:
+    if not failed_checks:
+        return "ok"
+    parts = [f"{item['check_name']}:{item['status']}" for item in failed_checks]
+    return "|".join(sorted(parts))
+
+def _watchdog_severity_and_priority(failed_checks: list[dict[str, Any]]) -> tuple[str, str]:
+    failed_names = {item["check_name"] for item in failed_checks}
+    if "local_health" in failed_names or "public_health" in failed_names:
+        return ("critical", "P1")
+    if any(item["kind"] == "technical" for item in failed_checks):
+        return ("high", "P1")
+    return ("medium", "P2")
+
+def _watchdog_subsystem(failed_checks: list[dict[str, Any]]) -> str:
+    failed_names = {item["check_name"] for item in failed_checks}
+    if "public_health" in failed_names:
+        return "caddy-routing"
+    if "local_health" in failed_names:
+        return "agent-runtime"
+    if "handoffs_api" in failed_names:
+        return "handoff-api"
+    if "chat_status_contract" in failed_names:
+        return "chat-contract"
+    if "command_pwd_contract" in failed_names:
+        return "command-contract"
+    return "mixed-runtime"
+
+def _watchdog_next_action(failed_checks: list[dict[str, Any]]) -> str:
+    subsystem = _watchdog_subsystem(failed_checks)
+
+    if subsystem == "caddy-routing":
+        return "Prüfe zuerst öffentliches Routing, Health-Weiterleitung und Caddy-Konfiguration. Danach lokalen Health-Pfad gegen 127.0.0.1:8000 gegentesten."
+    if subsystem == "agent-runtime":
+        return "Prüfe zuerst efro-agent.service, lokale /health-Antwort und Prozessstatus auf Port 8000."
+    if subsystem == "handoff-api":
+        return "Prüfe zuerst /api/handoffs lokal, Handoff-Verzeichnis und JSON-Lese-/Schreibpfad."
+    if subsystem == "chat-contract":
+        return "Prüfe zuerst /api/chat mit status-Prompt und vergleiche die Antwort mit dem erwarteten Read-only-Vertrag."
+    if subsystem == "command-contract":
+        return "Prüfe zuerst /command mit pwd im brain-Repo und vergleiche die Antwort mit dem erwarteten Disabled-Vertrag."
+
+    return "Prüfe zuerst die fehlgeschlagenen Checks, priorisiere technische Fehler vor semantischen Antwortfehlern und dokumentiere nur verifizierte Befunde."
+
+def _create_watchdog_handoff(shop_key: str, failed_checks: list[dict[str, Any]], all_checks: list[dict[str, Any]]) -> HandoffRecord:
+    shop_domain = os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com"
+    severity, priority = _watchdog_severity_and_priority(failed_checks)
+    subsystem = _watchdog_subsystem(failed_checks)
+    summary = f"Watchdog erkannte {len(failed_checks)} fehlerhafte Checks für {shop_domain}: " + ", ".join(item["check_name"] for item in failed_checks)
+
+    packet = HandoffPacket(
+        incident_id=f"watchdog_{shop_key}_{uuid4().hex[:8]}",
+        shop_domain=shop_domain,
+        priority=priority,
+        severity=severity,
+        scope="watchdog/read-only",
+        likely_repo="efro-agent",
+        likely_subsystem=subsystem,
+        summary=summary,
+        top_findings=[f"{item['check_name']}: {item['evidence']}" for item in failed_checks[:5]],
+        checks_run=[f"{item['check_name']}={item['status']}" for item in all_checks],
+        recommended_next_action=_watchdog_next_action(failed_checks),
+    )
+    return create_handoff_record(packet)
+
+def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
+    if shop_key != "efro":
+        return {
+            "ok": False,
+            "error": f"Shop '{shop_key}' wird aktuell noch nicht unterstützt. Erster sicherer Watchdog-Scope ist nur 'efro'."
+        }
+
+    all_checks = _efro_watchdog_checks()
+    observed_failed_checks = [item for item in all_checks if item["status"] == "error"]
+    non_public_failed_checks = [item for item in observed_failed_checks if item["check_name"] != "public_health"]
+    public_health_failed = any(item["check_name"] == "public_health" for item in observed_failed_checks)
+
+    public_key = f"{shop_key}:public_health"
+    public_failure_threshold = _watchdog_public_failure_threshold()
+
+    with WATCHDOG_LOCK:
+        previous_signature = WATCHDOG_STATE["active_failure_signatures"].get(shop_key)
+        previous_public_failure_count = int(WATCHDOG_STATE["consecutive_failures"].get(public_key, 0) or 0)
+
+    public_health_consecutive_failures = previous_public_failure_count + 1 if public_health_failed else 0
+
+    incident_failed_checks = list(non_public_failed_checks)
+    if public_health_failed and public_health_consecutive_failures >= public_failure_threshold:
+        incident_failed_checks.extend(
+            [item for item in observed_failed_checks if item["check_name"] == "public_health"]
+        )
+
+    failure_signature = _watchdog_failure_signature(incident_failed_checks)
+    handoff_record = None
+
+    if incident_failed_checks and failure_signature != previous_signature:
+        handoff_record = _create_watchdog_handoff(shop_key, incident_failed_checks, all_checks)
+
+    if incident_failed_checks:
+        summary_status = "red"
+    elif observed_failed_checks:
+        summary_status = "yellow"
+    else:
+        summary_status = "green"
+
+    result = {
+        "shop_key": shop_key,
+        "shop_domain": os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com",
+        "run_at": _watchdog_now(),
+        "ok": len(incident_failed_checks) == 0,
+        "degraded": len(observed_failed_checks) > 0,
+        "summary_status": summary_status,
+        "mode": "read-only watchdog",
+        "answer_quality_scope": "internal contract checks plus external public health probe via curl subprocess; no full semantic correctness scoring yet",
+        "observed_failed_count": len(observed_failed_checks),
+        "failed_count": len(incident_failed_checks),
+        "public_health_consecutive_failures": public_health_consecutive_failures,
+        "public_health_incident_threshold": public_failure_threshold,
+        "checks": all_checks,
+        "handoff_created": handoff_record is not None,
+        "handoff_id": handoff_record.handoff_id if handoff_record else None,
+    }
+
+    with WATCHDOG_LOCK:
+        WATCHDOG_STATE["enabled"] = _watchdog_enabled()
+        WATCHDOG_STATE["interval_seconds"] = _watchdog_interval_seconds()
+        WATCHDOG_STATE["last_run_at"] = result["run_at"]
+        WATCHDOG_STATE["last_results"][shop_key] = result
+        WATCHDOG_STATE["consecutive_failures"][public_key] = public_health_consecutive_failures
+
+        if public_health_failed:
+            WATCHDOG_STATE["last_error_at"][public_key] = result["run_at"]
+        else:
+            WATCHDOG_STATE["last_ok_at"][public_key] = result["run_at"]
+
+        if incident_failed_checks:
+            WATCHDOG_STATE["active_failure_signatures"][shop_key] = failure_signature
+            if handoff_record:
+                WATCHDOG_STATE["last_handoff_ids"][shop_key] = handoff_record.handoff_id
+        else:
+            WATCHDOG_STATE["active_failure_signatures"].pop(shop_key, None)
+
+    log_message(
+        f"WATCHDOG_RUN shop={shop_key} ok={result['ok']} degraded={result['degraded']} "
+        f"observed_failed_count={result['observed_failed_count']} failed_count={result['failed_count']} "
+        f"public_health_consecutive_failures={public_health_consecutive_failures}/{public_failure_threshold} "
+        f"handoff_id={result['handoff_id'] or '-'}"
+    )
+    return result
+
+def _watchdog_loop():
+    while True:
+        try:
+            run_watchdog_cycle("efro")
+        except Exception as e:
+            log_message(f"WATCHDOG_LOOP_ERROR shop=efro error={e}")
+        time.sleep(_watchdog_interval_seconds())
+
+@app.on_event("startup")
+async def startup_watchdog():
+    with WATCHDOG_LOCK:
+        WATCHDOG_STATE["enabled"] = _watchdog_enabled()
+        WATCHDOG_STATE["interval_seconds"] = _watchdog_interval_seconds()
+
+        if WATCHDOG_STATE["enabled"] and not WATCHDOG_STATE["thread_started"]:
+            thread = threading.Thread(target=_watchdog_loop, daemon=True, name="efro-watchdog")
+            thread.start()
+            WATCHDOG_STATE["thread_started"] = True
+            log_message(
+                f"WATCHDOG_START enabled=1 interval_seconds={WATCHDOG_STATE['interval_seconds']} shop=efro"
+            )
+        else:
+            log_message(
+                f"WATCHDOG_START enabled={1 if WATCHDOG_STATE['enabled'] else 0} "
+                f"interval_seconds={WATCHDOG_STATE['interval_seconds']} thread_started={WATCHDOG_STATE['thread_started']}"
+            )
 # --- Vercel API (Logs, Deployments) ---
 
 def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
@@ -577,6 +1039,54 @@ async def get_handoffs(limit: int = 25):
     }
 
 
+@app.get("/api/watchdog/status")
+async def get_watchdog_status():
+    with WATCHDOG_LOCK:
+        return {
+            "enabled": WATCHDOG_STATE["enabled"],
+            "interval_seconds": WATCHDOG_STATE["interval_seconds"],
+            "last_run_at": WATCHDOG_STATE["last_run_at"],
+            "thread_started": WATCHDOG_STATE["thread_started"],
+            "supported_shops": ["efro"],
+            "last_results": WATCHDOG_STATE["last_results"],
+            "last_handoff_ids": WATCHDOG_STATE["last_handoff_ids"],
+            "consecutive_failures": WATCHDOG_STATE["consecutive_failures"],
+            "last_ok_at": WATCHDOG_STATE["last_ok_at"],
+            "last_error_at": WATCHDOG_STATE["last_error_at"],
+            "note": "Antwortqualitätsprüfung ist in dieser ersten Stufe nur kontraktbasiert, nicht voll semantisch.",
+        }
+
+@app.get("/api/watchdog/summary")
+async def get_watchdog_summary(shop: str = "efro"):
+    with WATCHDOG_LOCK:
+        result = WATCHDOG_STATE["last_results"].get(shop) or {}
+        public_key = f"{shop}:public_health"
+        has_run = bool(WATCHDOG_STATE["last_run_at"]) and bool(result)
+
+        return {
+            "shop": shop,
+            "supported": shop == "efro",
+            "enabled": WATCHDOG_STATE["enabled"],
+            "interval_seconds": WATCHDOG_STATE["interval_seconds"],
+            "last_run_at": WATCHDOG_STATE["last_run_at"],
+            "has_run": has_run,
+            "bootstrap_required": not has_run,
+            "summary_status": result.get("summary_status", "not_run_yet" if not has_run else "unknown"),
+            "ok": result.get("ok"),
+            "degraded": result.get("degraded"),
+            "observed_failed_count": result.get("observed_failed_count"),
+            "failed_count": result.get("failed_count"),
+            "public_health_consecutive_failures": WATCHDOG_STATE["consecutive_failures"].get(public_key, 0),
+            "public_health_incident_threshold": result.get("public_health_incident_threshold", _watchdog_public_failure_threshold()),
+            "last_handoff_id": WATCHDOG_STATE["last_handoff_ids"].get(shop),
+            "last_public_health_error_at": WATCHDOG_STATE["last_error_at"].get(public_key),
+            "last_public_health_ok_at": WATCHDOG_STATE["last_ok_at"].get(public_key),
+            "control_center_note": "Control Center soll primär diesen Summary-Status lesen; falls bootstrap_required=true, zuerst /api/watchdog/run ausführen oder den Watchdog-Loop aktivieren.",
+        }
+
+@app.api_route("/api/watchdog/run", methods=["GET", "POST"])
+async def run_watchdog(shop: str = "efro"):
+    return run_watchdog_cycle(shop)
 @app.post("/tool")
 async def call_tool(req: ToolRequest):
     if req.tool == "linter":
