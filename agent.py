@@ -3,9 +3,10 @@ import subprocess
 import json
 import ollama
 import re
+from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import chromadb
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
@@ -13,6 +14,8 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from datetime import datetime   # <-- NEU
 
+import threading
+import time
 load_dotenv()
 
 # --- Logging-Hilfsfunktion ---
@@ -40,6 +43,7 @@ REPO_PATHS = {
     "widget": "/opt/efro-agent/repos/efro-widget",
     "shopify": "/opt/efro-agent/repos/efro-shopify"
 }
+HANDOFF_DIR = os.getenv("EFRO_AGENT_HANDOFF_DIR", "/opt/efro-agent/handoffs")
 # -----------------------------------
 
 # --- Embedding-Funktion (lokal) ---
@@ -135,8 +139,33 @@ def deterministic_optimize(repo_key):
 
 def parse_direct_command(message: str):
     text = message.strip().lower()
+    if not text:
+        return None
+
     if text in ("status", "agent status"):
         return ("status", None)
+
+    if text in ("smoke shopify", "smoke_shopify"):
+        return ("smoke_shopify", "shopify")
+
+    parts = text.split()
+    if len(parts) >= 2:
+        command = parts[0]
+        repo = parts[1]
+
+        command_aliases = {
+            "lint": "linter",
+            "linter": "linter",
+            "build": "build",
+            "test": "test",
+            "install": "install",
+            "optimize": "optimize",
+        }
+
+        normalized_command = command_aliases.get(command)
+        if normalized_command and repo in REPO_PATHS:
+            return (normalized_command, repo)
+
     return None
 
 
@@ -149,7 +178,547 @@ def read_file(path):
             return f.read()
     except Exception as e:
         return f"Fehler beim Lesen: {e}"
+
+
+class HandoffPacket(BaseModel):
+    incident_id: str
+    shop_domain: str
+    priority: str
+    severity: str
+    scope: str
+    likely_repo: str
+    likely_subsystem: str
+    summary: str
+    top_findings: list[str] = Field(default_factory=list)
+    checks_run: list[str] = Field(default_factory=list)
+    recommended_next_action: str
+
+
+class HandoffRecord(HandoffPacket):
+    handoff_id: str
+    created_at: str
+
+
+class HandoffCreateResponse(BaseModel):
+    handoff_id: str
+    handoff_path: str
+    packet: HandoffRecord
+
+
+def _ensure_handoff_dir():
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+
+
+def _handoff_file_path(handoff_id: str) -> str:
+    safe_handoff_id = re.sub(r"[^a-zA-Z0-9_-]", "", handoff_id)
+    return os.path.join(HANDOFF_DIR, f"{safe_handoff_id}.json")
+
+
+def create_handoff_record(packet: HandoffPacket) -> HandoffRecord:
+    _ensure_handoff_dir()
+    handoff_id = f"handoff_{uuid4().hex[:12]}"
+    record = HandoffRecord(
+        handoff_id=handoff_id,
+        created_at=datetime.now().isoformat(),
+        **packet.model_dump(),
+    )
+
+    with open(_handoff_file_path(handoff_id), "w", encoding="utf-8") as f:
+        json.dump(record.model_dump(), f, ensure_ascii=False, indent=2)
+
+    return record
+
+
+def load_handoff_record(handoff_id: str) -> HandoffRecord:
+    path = _handoff_file_path(handoff_id)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Handoff nicht gefunden")
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    return HandoffRecord(**payload)
+
+
+def list_handoff_records(limit: int = 25) -> list[dict[str, Any]]:
+    _ensure_handoff_dir()
+    records: list[HandoffRecord] = []
+
+    for entry in os.listdir(HANDOFF_DIR):
+        if not re.fullmatch(r"handoff_[a-zA-Z0-9_-]+\.json", entry):
+            continue
+
+        path = os.path.join(HANDOFF_DIR, entry)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            records.append(HandoffRecord(**payload))
+        except Exception as e:
+            log_message(f"HANDOFF_LIST_SKIP file={entry} error={e}")
+
+    records.sort(key=lambda record: record.created_at, reverse=True)
+    return [record.model_dump() for record in records[:limit]]
         
+WATCHDOG_LOCK = threading.Lock()
+WATCHDOG_STATE: dict[str, Any] = {
+    "enabled": False,
+    "interval_seconds": 120,
+    "last_run_at": None,
+    "last_results": {},
+    "active_failure_signatures": {},
+    "last_handoff_ids": {},
+    "consecutive_failures": {},
+    "last_ok_at": {},
+    "last_error_at": {},
+    "thread_started": False,
+}
+
+def _watchdog_enabled() -> bool:
+    return os.getenv("EFRO_AGENT_WATCHDOG_ENABLED", "0").strip() == "1"
+
+def _watchdog_interval_seconds() -> int:
+    raw = os.getenv("EFRO_AGENT_WATCHDOG_INTERVAL_SECONDS", "120").strip()
+    try:
+        return max(30, int(raw))
+    except Exception:
+        return 120
+
+def _watchdog_public_failure_threshold() -> int:
+    raw = os.getenv("EFRO_AGENT_PUBLIC_FAILURE_THRESHOLD", "3").strip()
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 3
+
+def _watchdog_now() -> str:
+    return datetime.now().isoformat()
+
+def _clip_text(value: str, limit: int = 240) -> str:
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+def _watchdog_check_result(
+    check_name: str,
+    target: str,
+    status: str,
+    kind: str,
+    evidence: str,
+    expected: str,
+    observed: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    return {
+        "check_name": check_name,
+        "target": target,
+        "status": status,
+        "kind": kind,
+        "evidence": evidence,
+        "expected": expected,
+        "observed": observed,
+        "duration_ms": duration_ms,
+        "timestamp": _watchdog_now(),
+    }
+
+def _run_observation_check(
+    check_name: str,
+    target: str,
+    status: str,
+    kind: str,
+    evidence: str,
+    expected: str,
+    observed: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    return _watchdog_check_result(
+        check_name=check_name,
+        target=target,
+        status=status,
+        kind=kind,
+        evidence=evidence,
+        expected=expected,
+        observed=observed,
+        duration_ms=duration_ms,
+    )
+
+
+def _build_local_health_payload() -> dict[str, Any]:
+    _ensure_handoff_dir()
+    handoff_count = 0
+    for entry in os.listdir(HANDOFF_DIR):
+        if re.fullmatch(r"handoff_[a-zA-Z0-9_-]+\.json", entry):
+            handoff_count += 1
+
+    return {
+        "status": "ok",
+        "service": "efro-agent",
+        "time": _watchdog_now(),
+        "model": os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b"),
+        "handoff_dir": HANDOFF_DIR,
+        "handoff_dir_exists": os.path.isdir(HANDOFF_DIR),
+        "handoff_count": handoff_count,
+        "repos": sorted(REPO_PATHS.keys()),
+    }
+
+
+def _check_local_health_contract() -> dict[str, Any]:
+    started = time.time()
+    try:
+        payload = _build_local_health_payload()
+        ok = payload["status"] == "ok" and payload["handoff_dir_exists"] is True
+        evidence = _clip_text(json.dumps(payload, ensure_ascii=False), 220)
+        return _run_observation_check(
+            check_name="local_health",
+            target="internal:health-payload",
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected="status=ok and handoff_dir_exists=true",
+            observed=f"status={payload['status']}; handoff_dir_exists={payload['handoff_dir_exists']}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="local_health",
+            target="internal:health-payload",
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="status=ok and handoff_dir_exists=true",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_public_health_contract() -> dict[str, Any]:
+    started = time.time()
+    shop_domain = os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com"
+    target = f"https://{shop_domain}/health"
+    expected_contains = '"status":"ok"'
+    cmd = ["curl", "--silent", "--show-error", "--location", "--max-time", "15", target]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        ok = completed.returncode == 0 and expected_contains in stdout
+        evidence = _clip_text(
+            f"returncode={completed.returncode}; stdout={stdout}; stderr={stderr}",
+            220,
+        )
+        return _run_observation_check(
+            check_name="public_health",
+            target=target,
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            observed=f"returncode={completed.returncode}; contains={expected_contains in stdout}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except subprocess.TimeoutExpired as e:
+        return _run_observation_check(
+            check_name="public_health",
+            target=target,
+            status="error",
+            kind="technical",
+            evidence=f"timeout={e}",
+            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            observed=f"timeout={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="public_health",
+            target=target,
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_handoffs_api_contract() -> dict[str, Any]:
+    started = time.time()
+    try:
+        items = list_handoff_records(limit=1)
+        ok = isinstance(items, list)
+        evidence = f"items_count={len(items)}"
+        return _run_observation_check(
+            check_name="handoffs_api",
+            target="internal:list_handoff_records(limit=1)",
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected="list result",
+            observed=f"type={type(items).__name__}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="handoffs_api",
+            target="internal:list_handoff_records(limit=1)",
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="list result",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_chat_status_contract() -> dict[str, Any]:
+    started = time.time()
+    expected_reply = "Agent läuft im read-only Incident-Reporter-Modus. Er sammelt Belege und schreibt Berichte, führt aber keine Optimierungen aus."
+    try:
+        direct = parse_direct_command("status")
+        ok = direct == ("status", None)
+        return _run_observation_check(
+            check_name="chat_status_contract",
+            target="internal:parse_direct_command('status')",
+            status="ok" if ok else "error",
+            kind="answer_contract",
+            evidence=f"direct={direct}; expected_reply={expected_reply}",
+            expected="('status', None) and read-only status contract",
+            observed=f"direct={direct}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="chat_status_contract",
+            target="internal:parse_direct_command('status')",
+            status="error",
+            kind="answer_contract",
+            evidence=f"exception={e}",
+            expected="('status', None) and read-only status contract",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _check_command_pwd_contract() -> dict[str, Any]:
+    started = time.time()
+    expected_output = "DISABLED: unsafe shell execution removed"
+    try:
+        output = run_command("pwd", REPO_PATHS["brain"])
+        ok = output == expected_output
+        return _run_observation_check(
+            check_name="command_pwd_contract",
+            target="internal:run_command('pwd', REPO_PATHS['brain'])",
+            status="ok" if ok else "error",
+            kind="answer_contract",
+            evidence=f"output={output}",
+            expected=expected_output,
+            observed=output,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="command_pwd_contract",
+            target="internal:run_command('pwd', REPO_PATHS['brain'])",
+            status="error",
+            kind="answer_contract",
+            evidence=f"exception={e}",
+            expected=expected_output,
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _efro_watchdog_checks() -> list[dict[str, Any]]:
+    return [
+        _check_local_health_contract(),
+        _check_public_health_contract(),
+        _check_handoffs_api_contract(),
+        _check_chat_status_contract(),
+        _check_command_pwd_contract(),
+    ]
+
+
+def _watchdog_failure_signature(failed_checks: list[dict[str, Any]]) -> str:
+    if not failed_checks:
+        return "ok"
+    parts = [f"{item['check_name']}:{item['status']}" for item in failed_checks]
+    return "|".join(sorted(parts))
+
+def _watchdog_severity_and_priority(failed_checks: list[dict[str, Any]]) -> tuple[str, str]:
+    failed_names = {item["check_name"] for item in failed_checks}
+    if "local_health" in failed_names or "public_health" in failed_names:
+        return ("critical", "P1")
+    if any(item["kind"] == "technical" for item in failed_checks):
+        return ("high", "P1")
+    return ("medium", "P2")
+
+def _watchdog_subsystem(failed_checks: list[dict[str, Any]]) -> str:
+    failed_names = {item["check_name"] for item in failed_checks}
+    if "public_health" in failed_names:
+        return "caddy-routing"
+    if "local_health" in failed_names:
+        return "agent-runtime"
+    if "handoffs_api" in failed_names:
+        return "handoff-api"
+    if "chat_status_contract" in failed_names:
+        return "chat-contract"
+    if "command_pwd_contract" in failed_names:
+        return "command-contract"
+    return "mixed-runtime"
+
+def _watchdog_next_action(failed_checks: list[dict[str, Any]]) -> str:
+    subsystem = _watchdog_subsystem(failed_checks)
+
+    if subsystem == "caddy-routing":
+        return "Prüfe zuerst öffentliches Routing, Health-Weiterleitung und Caddy-Konfiguration. Danach lokalen Health-Pfad gegen 127.0.0.1:8000 gegentesten."
+    if subsystem == "agent-runtime":
+        return "Prüfe zuerst efro-agent.service, lokale /health-Antwort und Prozessstatus auf Port 8000."
+    if subsystem == "handoff-api":
+        return "Prüfe zuerst /api/handoffs lokal, Handoff-Verzeichnis und JSON-Lese-/Schreibpfad."
+    if subsystem == "chat-contract":
+        return "Prüfe zuerst /api/chat mit status-Prompt und vergleiche die Antwort mit dem erwarteten Read-only-Vertrag."
+    if subsystem == "command-contract":
+        return "Prüfe zuerst /command mit pwd im brain-Repo und vergleiche die Antwort mit dem erwarteten Disabled-Vertrag."
+
+    return "Prüfe zuerst die fehlgeschlagenen Checks, priorisiere technische Fehler vor semantischen Antwortfehlern und dokumentiere nur verifizierte Befunde."
+
+def _create_watchdog_handoff(shop_key: str, failed_checks: list[dict[str, Any]], all_checks: list[dict[str, Any]]) -> HandoffRecord:
+    shop_domain = os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com"
+    severity, priority = _watchdog_severity_and_priority(failed_checks)
+    subsystem = _watchdog_subsystem(failed_checks)
+    summary = f"Watchdog erkannte {len(failed_checks)} fehlerhafte Checks für {shop_domain}: " + ", ".join(item["check_name"] for item in failed_checks)
+
+    packet = HandoffPacket(
+        incident_id=f"watchdog_{shop_key}_{uuid4().hex[:8]}",
+        shop_domain=shop_domain,
+        priority=priority,
+        severity=severity,
+        scope="watchdog/read-only",
+        likely_repo="efro-agent",
+        likely_subsystem=subsystem,
+        summary=summary,
+        top_findings=[f"{item['check_name']}: {item['evidence']}" for item in failed_checks[:5]],
+        checks_run=[f"{item['check_name']}={item['status']}" for item in all_checks],
+        recommended_next_action=_watchdog_next_action(failed_checks),
+    )
+    return create_handoff_record(packet)
+
+def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
+    if shop_key != "efro":
+        return {
+            "ok": False,
+            "error": f"Shop '{shop_key}' wird aktuell noch nicht unterstützt. Erster sicherer Watchdog-Scope ist nur 'efro'."
+        }
+
+    all_checks = _efro_watchdog_checks()
+    observed_failed_checks = [item for item in all_checks if item["status"] == "error"]
+    non_public_failed_checks = [item for item in observed_failed_checks if item["check_name"] != "public_health"]
+    public_health_failed = any(item["check_name"] == "public_health" for item in observed_failed_checks)
+
+    public_key = f"{shop_key}:public_health"
+    public_failure_threshold = _watchdog_public_failure_threshold()
+
+    with WATCHDOG_LOCK:
+        previous_signature = WATCHDOG_STATE["active_failure_signatures"].get(shop_key)
+        previous_public_failure_count = int(WATCHDOG_STATE["consecutive_failures"].get(public_key, 0) or 0)
+
+    public_health_consecutive_failures = previous_public_failure_count + 1 if public_health_failed else 0
+
+    incident_failed_checks = list(non_public_failed_checks)
+    if public_health_failed and public_health_consecutive_failures >= public_failure_threshold:
+        incident_failed_checks.extend(
+            [item for item in observed_failed_checks if item["check_name"] == "public_health"]
+        )
+
+    failure_signature = _watchdog_failure_signature(incident_failed_checks)
+    handoff_record = None
+
+    if incident_failed_checks and failure_signature != previous_signature:
+        handoff_record = _create_watchdog_handoff(shop_key, incident_failed_checks, all_checks)
+
+    if incident_failed_checks:
+        summary_status = "red"
+    elif observed_failed_checks:
+        summary_status = "yellow"
+    else:
+        summary_status = "green"
+
+    result = {
+        "shop_key": shop_key,
+        "shop_domain": os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com",
+        "run_at": _watchdog_now(),
+        "ok": len(incident_failed_checks) == 0,
+        "degraded": len(observed_failed_checks) > 0,
+        "summary_status": summary_status,
+        "mode": "read-only watchdog",
+        "answer_quality_scope": "internal contract checks plus external public health probe via curl subprocess; no full semantic correctness scoring yet",
+        "observed_failed_count": len(observed_failed_checks),
+        "failed_count": len(incident_failed_checks),
+        "public_health_consecutive_failures": public_health_consecutive_failures,
+        "public_health_incident_threshold": public_failure_threshold,
+        "checks": all_checks,
+        "handoff_created": handoff_record is not None,
+        "handoff_id": handoff_record.handoff_id if handoff_record else None,
+    }
+
+    with WATCHDOG_LOCK:
+        WATCHDOG_STATE["enabled"] = _watchdog_enabled()
+        WATCHDOG_STATE["interval_seconds"] = _watchdog_interval_seconds()
+        WATCHDOG_STATE["last_run_at"] = result["run_at"]
+        WATCHDOG_STATE["last_results"][shop_key] = result
+        WATCHDOG_STATE["consecutive_failures"][public_key] = public_health_consecutive_failures
+
+        if public_health_failed:
+            WATCHDOG_STATE["last_error_at"][public_key] = result["run_at"]
+        else:
+            WATCHDOG_STATE["last_ok_at"][public_key] = result["run_at"]
+
+        if incident_failed_checks:
+            WATCHDOG_STATE["active_failure_signatures"][shop_key] = failure_signature
+            if handoff_record:
+                WATCHDOG_STATE["last_handoff_ids"][shop_key] = handoff_record.handoff_id
+        else:
+            WATCHDOG_STATE["active_failure_signatures"].pop(shop_key, None)
+
+    log_message(
+        f"WATCHDOG_RUN shop={shop_key} ok={result['ok']} degraded={result['degraded']} "
+        f"observed_failed_count={result['observed_failed_count']} failed_count={result['failed_count']} "
+        f"public_health_consecutive_failures={public_health_consecutive_failures}/{public_failure_threshold} "
+        f"handoff_id={result['handoff_id'] or '-'}"
+    )
+    return result
+
+def _watchdog_loop():
+    while True:
+        try:
+            run_watchdog_cycle("efro")
+        except Exception as e:
+            log_message(f"WATCHDOG_LOOP_ERROR shop=efro error={e}")
+        time.sleep(_watchdog_interval_seconds())
+
+@app.on_event("startup")
+async def startup_watchdog():
+    with WATCHDOG_LOCK:
+        WATCHDOG_STATE["enabled"] = _watchdog_enabled()
+        WATCHDOG_STATE["interval_seconds"] = _watchdog_interval_seconds()
+
+        if WATCHDOG_STATE["enabled"] and not WATCHDOG_STATE["thread_started"]:
+            thread = threading.Thread(target=_watchdog_loop, daemon=True, name="efro-watchdog")
+            thread.start()
+            WATCHDOG_STATE["thread_started"] = True
+            log_message(
+                f"WATCHDOG_START enabled=1 interval_seconds={WATCHDOG_STATE['interval_seconds']} shop=efro"
+            )
+        else:
+            log_message(
+                f"WATCHDOG_START enabled={1 if WATCHDOG_STATE['enabled'] else 0} "
+                f"interval_seconds={WATCHDOG_STATE['interval_seconds']} thread_started={WATCHDOG_STATE['thread_started']}"
+            )
 # --- Vercel API (Logs, Deployments) ---
 
 def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
@@ -159,10 +728,16 @@ def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
         "Content-Type": "application/json"
     }
     url = f"https://api.vercel.com/{endpoint}"
+
     if method != "GET":
         return "DISABLED: non-read Vercel requests removed"
-    resp = requests.get(url, headers=headers)
-    return resp.text
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.RequestException as e:
+        return f"Fehler bei Vercel-API: {e}"
 
 def get_vercel_logs(project_id: str):
     """Ruft die letzten Deployment-Logs von Vercel ab (verwendet globalen VERCEL_TOKEN)."""
@@ -188,10 +763,16 @@ def render_request(endpoint: str, api_token: str, method="GET", data=None):
         "Content-Type": "application/json"
     }
     url = f"https://api.render.com/{endpoint}"
+
     if method != "GET":
         return "DISABLED: non-read Render requests removed"
-    resp = requests.get(url, headers=headers)
-    return resp.text
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.RequestException as e:
+        return f"Fehler bei Render-API: {e}"
 
 def get_render_logs(service_id: str):
     """Ruft die Logs eines Render-Service ab (verwendet globalen RENDER_TOKEN)."""
@@ -267,96 +848,158 @@ class EfroAgent:
         except Exception:
             self.system_prompt = "EFRO MASTER PROMPT NICHT GEFUNDEN"
 
-    def query(self, user_input, extra_context=None):
-        # Chroma vorerst deaktiviert für Speed
-        context = "Kein Kontext (Chroma deaktiviert für Speed)."
-        extra = f"\nZusätzlicher Kontext (Tool-Ergebnisse):\n{extra_context}\n" if extra_context else ""
+        self.runtime_prompt = """
+RUNTIME-LAYER:
+- Nutze den Master Prompt als strategische Wahrheit, aber antworte operativ, kompakt und faktenbasiert.
+- Behandle EFRO als Produkt-, Sales-, Monitoring- und Operator-System, nicht nur als UI oder Prompt.
+- Priorität in der Laufzeit: verifizieren, eingrenzen, dann handeln.
 
-        prompt = f"""
-{self.system_prompt}
-
-
-
-REGELN FÜR WAHRHEIT:
-
-- Du darfst keine Zusammenfassungen geben, ohne vorher Tools benutzt zu haben.
-- Jede technische Aussage muss auf einem Tool-Ergebnis basieren.
-- Wenn kein Tool genutzt wurde → darfst du KEINE finale Bewertung geben.
-- Wenn du unsicher bist → sag explizit "nicht verifiziert".
-- Bevor du optimierst:
-  1. prüfe mit Tools
-  2. analysiere Output
-  3. entscheide dann
-
-VERBOTEN:
-- erfundene Technologien
-- erfundene Tests
-- erfundene Deployments
-- erfundene Prozentzahlen
-
-WICHTIG:
-- Erfinde niemals Technologien, Dateien, Tests, Datenbanken oder Ergebnisse.
-- Behaupte nur etwas, wenn es durch echten Code, echte Logs oder echte Tool-Ergebnisse belegt ist.
-- Wenn du etwas nicht geprüft hast, sage klar: "nicht verifiziert".
+WAHRHEITSREGELN:
+- Keine finale technische Bewertung ohne Tool-Ergebnis, Code, Logs oder klar benannten Ist-Zustand.
+- Wenn etwas nicht geprüft wurde, sage explizit: nicht verifiziert.
+- Erfinde keine Technologien, Dateien, Tests, Deployments oder Prozentwerte.
 - Wenn ein Tool sinnvoll ist, benutze es zuerst.
-- Gib keine erfundenen Prozentwerte für Tests oder Deployment-Status an.
-- Antworte faktenbasiert, nicht fantasiebasiert.
-- Wenn du optimierst, beschreibe nur reale Schritte, die du tatsächlich geprüft oder ausgeführt hast.
+- Beschreibe Optimierungen nur dann als erledigt, wenn sie wirklich geprüft oder ausgeführt wurden.
 
-
-TOOLS DIE DU NUTZEN KANNST:
+TOOLS:
 - linter <repo>
 - build <repo>
 - test <repo>
-- write_file <path> <content>
 - read_file <path>
 - vercel_logs <project_id>
 - render_logs <service_id>
 - supabase_tables
 - elevenlabs_agent <agent_id>
 
-WENN DU EIN TOOL VERWENDEN WILLST, NUTZE EXAKT DIESES FORMAT:
-
+TOOL-FORMAT:
 ```tool
 tool_name
 param1
 param2
 ```
 
+AUSGABESTIL:
+- Denke wie ein Senior Engineer / CTO.
+- Arbeite schrittweise, ruhig und operativ.
+- Nenne Risiken, Grenzen und offene Punkte klar.
+- Bevorzuge konkrete nächste Schritte statt allgemeiner Theorie.
+""".strip()
+
+        self.task_overlays = {
+            "general": """
+ALLGEMEINER OVERLAY:
+- Halte die Antwort fokussiert und auf den nächsten operativen Hebel gerichtet.
+- Wenn keine Tool-Nutzung nötig ist, bleibe klar über den unverifizierten Status.
+""".strip(),
+            "repo_investigation": """
+REPO-TRIAGE OVERLAY:
+- Arbeite repo-bewusst.
+- Bevorzuge Lint-, Build-, Test- und Log-Signale vor Vermutungen.
+- Achte auf Breaking Changes, Runtime-Risiken und Deployment-Folgen.
+""".strip(),
+            "incident": """
+INCIDENT OVERLAY:
+- Denke in Priorität, Severity, Scope, Checks und nächster Operator-Aktion.
+- Bevorzuge schnelle Eingrenzung, klare Hypothesen und risikoarme nächste Schritte.
+""".strip(),
+            "control_center": """
+CONTROL-CENTER OVERLAY:
+- Denke in Dashboard, Operator-Workflow, Handoff und Monitoring-Sicht.
+- Halte die Grenze zwischen efro-control-center und efro-agent bewusst sauber.
+""".strip(),
+        }
+
+    def detect_overlay(self, user_input: str) -> str:
+        text = user_input.lower()
+
+        if any(keyword in text for keyword in ["incident", "alert", "severity", "priority", "watchdog", "playbook"]):
+            return "incident"
+
+        if any(keyword in text for keyword in ["control center", "dashboard", "handoff", "operator", "shop status"]):
+            return "control_center"
+
+        if any(repo_key in text for repo_key in REPO_PATHS) or any(keyword in text for keyword in ["repo", "build", "lint", "test", "bug", "deploy"]):
+            return "repo_investigation"
+
+        return "general"
+
+    def format_extra_context(self, extra_context=None):
+        if not extra_context:
+            return "Kein zusätzlicher Tool-Kontext."
+
+        if isinstance(extra_context, list):
+            formatted_parts = []
+            for item in extra_context[-8:]:
+                if isinstance(item, tuple) and len(item) == 2:
+                    role, content = item
+                    formatted_parts.append(f"{role}: {content}")
+                else:
+                    formatted_parts.append(str(item))
+            return "\n\n".join(formatted_parts)
+
+        return str(extra_context)
+
+    def format_memory(self):
+        recent_memory = self.memory[-5:]
+        if not recent_memory:
+            return "Kein relevanter Verlauf."
+
+        return "\n\n".join(
+            [f"Nutzer: {u}\nAssistent: {a}" for u, a in recent_memory]
+        )
+
+    def build_prompt(self, user_input, extra_context=None):
+        context = "Kein Kontext (Chroma deaktiviert für Speed)."
+        overlay_name = self.detect_overlay(user_input)
+        overlay = self.task_overlays.get(overlay_name, self.task_overlays["general"])
+        repo_mentions = [repo_key for repo_key in REPO_PATHS if repo_key in user_input.lower()]
+        repo_context = ", ".join(repo_mentions) if repo_mentions else "keine explizite Repo-Nennung"
+        extra = self.format_extra_context(extra_context)
+
+        return f"""
+{self.system_prompt}
+
+{self.runtime_prompt}
+
+TASK-OVERLAY ({overlay_name}):
+{overlay}
+
 SYSTEM-ZUSTAND:
-- Ziel: EFRO Projekt stabil + deployfähig + fehlerfrei
-- Fokus: keine Fehler, keine Breaking Changes, produktionsreif
+- Ziel: Probleme sicher analysieren, Belege sammeln und verständliche Incident-Reports schreiben
+- Fokus: read-only, faktenbasiert, keine Änderungen, keine Optimierung
+- Repo-Kontext: {repo_context}
 
 KONTEXT:
 {context}
 
 VERLAUF:
 {self.format_memory()}
+
+ZUSÄTZLICHER KONTEXT:
 {extra}
 
 USER:
 {user_input}
 
-WICHTIG:
-- Wenn ein Tool sinnvoll ist, benutze es direkt
-- Wenn mehrere Schritte nötig sind, führe sie logisch aus
-- Denke wie ein Senior Engineer / CTO
-
 ANTWORT:
 """
 
-        response = ollama.chat(
-            model="qwen2.5-coder:7b",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        reply = response["message"]["content"]
+    def query(self, user_input, extra_context=None):
+        prompt = self.build_prompt(user_input, extra_context=extra_context)
+        model_name = os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b")
+
+        try:
+            response = ollama.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            reply = response["message"]["content"]
+        except Exception as e:
+            reply = f"Agent-Fehler beim Modellaufruf ({model_name}): {e}"
+            log_message(f"OLLAMA_ERROR model={model_name} error={e}")
+
         self.memory.append((user_input, reply))
         return reply
-
-    def format_memory(self):
-        return "\n".join(
-            [f"Nutzer: {u}\nAssistent: {a}" for u, a in self.memory[-5:]]
-        )
 
 
 agent = EfroAgent()
@@ -366,6 +1009,84 @@ class ToolRequest(BaseModel):
     tool: str
     params: list[str]
 
+
+@app.post("/handoff", response_model=HandoffCreateResponse)
+async def create_handoff(packet: HandoffPacket):
+    record = create_handoff_record(packet)
+    log_message(f"HANDOFF_CREATE handoff_id={record.handoff_id} incident_id={record.incident_id} repo={record.likely_repo}")
+    return {
+        "handoff_id": record.handoff_id,
+        "handoff_path": f"/handoff/{record.handoff_id}",
+        "packet": record.model_dump(),
+    }
+
+
+@app.get("/api/handoff/{handoff_id}")
+async def get_handoff(handoff_id: str):
+    record = load_handoff_record(handoff_id)
+    log_message(f"HANDOFF_LOAD handoff_id={record.handoff_id} incident_id={record.incident_id}")
+    return record.model_dump()
+
+
+@app.get("/api/handoffs")
+async def get_handoffs(limit: int = 25):
+    safe_limit = max(1, min(limit, 100))
+    records = list_handoff_records(limit=safe_limit)
+    return {
+        "count": len(records),
+        "limit": safe_limit,
+        "items": records,
+    }
+
+
+@app.get("/api/watchdog/status")
+async def get_watchdog_status():
+    with WATCHDOG_LOCK:
+        return {
+            "enabled": WATCHDOG_STATE["enabled"],
+            "interval_seconds": WATCHDOG_STATE["interval_seconds"],
+            "last_run_at": WATCHDOG_STATE["last_run_at"],
+            "thread_started": WATCHDOG_STATE["thread_started"],
+            "supported_shops": ["efro"],
+            "last_results": WATCHDOG_STATE["last_results"],
+            "last_handoff_ids": WATCHDOG_STATE["last_handoff_ids"],
+            "consecutive_failures": WATCHDOG_STATE["consecutive_failures"],
+            "last_ok_at": WATCHDOG_STATE["last_ok_at"],
+            "last_error_at": WATCHDOG_STATE["last_error_at"],
+            "note": "Antwortqualitätsprüfung ist in dieser ersten Stufe nur kontraktbasiert, nicht voll semantisch.",
+        }
+
+@app.get("/api/watchdog/summary")
+async def get_watchdog_summary(shop: str = "efro"):
+    with WATCHDOG_LOCK:
+        result = WATCHDOG_STATE["last_results"].get(shop) or {}
+        public_key = f"{shop}:public_health"
+        has_run = bool(WATCHDOG_STATE["last_run_at"]) and bool(result)
+
+        return {
+            "shop": shop,
+            "supported": shop == "efro",
+            "enabled": WATCHDOG_STATE["enabled"],
+            "interval_seconds": WATCHDOG_STATE["interval_seconds"],
+            "last_run_at": WATCHDOG_STATE["last_run_at"],
+            "has_run": has_run,
+            "bootstrap_required": not has_run,
+            "summary_status": result.get("summary_status", "not_run_yet" if not has_run else "unknown"),
+            "ok": result.get("ok"),
+            "degraded": result.get("degraded"),
+            "observed_failed_count": result.get("observed_failed_count"),
+            "failed_count": result.get("failed_count"),
+            "public_health_consecutive_failures": WATCHDOG_STATE["consecutive_failures"].get(public_key, 0),
+            "public_health_incident_threshold": result.get("public_health_incident_threshold", _watchdog_public_failure_threshold()),
+            "last_handoff_id": WATCHDOG_STATE["last_handoff_ids"].get(shop),
+            "last_public_health_error_at": WATCHDOG_STATE["last_error_at"].get(public_key),
+            "last_public_health_ok_at": WATCHDOG_STATE["last_ok_at"].get(public_key),
+            "control_center_note": "Control Center soll primär diesen Summary-Status lesen; falls bootstrap_required=true, zuerst /api/watchdog/run ausführen oder den Watchdog-Loop aktivieren.",
+        }
+
+@app.api_route("/api/watchdog/run", methods=["GET", "POST"])
+async def run_watchdog(shop: str = "efro"):
+    return run_watchdog_cycle(shop)
 @app.post("/tool")
 async def call_tool(req: ToolRequest):
     if req.tool == "linter":
@@ -390,13 +1111,8 @@ async def call_tool(req: ToolRequest):
         log_message(f"Tool test repo={repo} -> {output[:200]}")
         return {"output": output}
     elif req.tool == "write_file":
-        if len(req.params) < 2:
-            return {"error": "Bitte Pfad und Inhalt angeben"}
-        path = req.params[0]
-        content = " ".join(req.params[1:])
-        result = write_file(path, content)
-        log_message(f"Tool write_file path={path} -> {result[:200]}")
-        return {"output": result}
+        log_message("Tool write_file -> blocked in read-only reporter mode")
+        return {"error": "write_file ist deaktiviert. Dieser Agent arbeitet im read-only Incident-Reporter-Modus."}
     elif req.tool == "read_file":
         if not req.params:
             return {"error": "Bitte Pfad angeben"}
@@ -438,11 +1154,43 @@ async def call_tool(req: ToolRequest):
 
 # --- Chat-Endpunkt ---
 class ChatRequest(BaseModel):
-    message: str
+    message: Optional[str] = None
+    prompt: Optional[str] = None
+    text: Optional[str] = None
+    handoff_id: Optional[str] = None
 
+@app.post("/api/chat")
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    user_input = req.message.strip()
+    user_input = (
+        getattr(req, "message", None)
+        or getattr(req, "prompt", None)
+        or getattr(req, "text", None)
+        or ""
+    ).strip()
+    if not user_input:
+        return {"reply": "", "message": "", "tool_results": [], "ok": False, "error": "Leere Nachricht"}
+    handoff_context = None
+
+    if req.handoff_id:
+        try:
+            handoff_record = load_handoff_record(req.handoff_id)
+            handoff_context = (
+                f"Handoff {handoff_record.handoff_id}\n"
+                f"Incident: {handoff_record.incident_id}\n"
+                f"Shop: {handoff_record.shop_domain}\n"
+                f"Priorität: {handoff_record.priority}\n"
+                f"Severity: {handoff_record.severity}\n"
+                f"Scope: {handoff_record.scope}\n"
+                f"Repo: {handoff_record.likely_repo}\n"
+                f"Subsystem: {handoff_record.likely_subsystem}\n"
+                f"Summary: {handoff_record.summary}\n"
+                f"Top Findings: {' | '.join(handoff_record.top_findings) if handoff_record.top_findings else 'Keine Angaben'}\n"
+                f"Checks Run: {' | '.join(handoff_record.checks_run) if handoff_record.checks_run else 'Keine Angaben'}\n"
+                f"Recommended Next Action: {handoff_record.recommended_next_action}"
+            )
+        except HTTPException:
+            handoff_context = f"Handoff {req.handoff_id} nicht gefunden"
 
     # -------- DIRECT COMMAND MODE (SCHNELL + VERTRAUENSWÜRDIG) --------
     direct = parse_direct_command(user_input)
@@ -451,7 +1199,7 @@ async def chat(req: ChatRequest):
 
         if command == "status":
             return {
-                "reply": "Agent läuft. Direkte Befehle: linter <repo>, build <repo>, test <repo>, install <repo>, optimize <repo>",
+                "reply": "Agent läuft im read-only Incident-Reporter-Modus. Er sammelt Belege und schreibt Berichte, führt aber keine Optimierungen aus.",
                 "tool_results": []
             }
 
@@ -498,17 +1246,10 @@ async def chat(req: ChatRequest):
             }
 
         if command == "install":
-            output = run_install(repo)
-            log_message(f"DIRECT install repo={repo} -> {output[:300]}")
+            log_message(f"DIRECT install repo={repo} -> blocked in read-only reporter mode")
             return {
-                "reply": f"Direktbefehl ausgeführt: install {repo}",
-                "tool_results": [
-                    {
-                        "tool": "install",
-                        "params": [repo],
-                        "output": output
-                    }
-                ]
+                "reply": "Install ist deaktiviert. Dieser Agent arbeitet als read-only Incident-Reporter und führt keine Änderungen aus.",
+                "tool_results": []
             }
 
         if command == "smoke_shopify":
@@ -526,22 +1267,19 @@ async def chat(req: ChatRequest):
             }    
 
         if command == "optimize":
-            result = deterministic_optimize(repo)
-            summary = []
-            for step in result["steps"]:
-                first_line = step["output"].strip().splitlines()[0] if step["output"].strip() else "Keine Ausgabe"
-                summary.append(f"{step['tool']} {repo}: {first_line}")
-
-            log_message(f"DIRECT optimize repo={repo} -> {' | '.join(summary)[:500]}")
+            log_message(f"DIRECT optimize repo={repo} -> disabled in read-only reporter mode")
             return {
-                "reply": "Deterministische Optimierung abgeschlossen:\n" + "\n".join(summary),
-                "tool_results": result["steps"]
+                "reply": "Optimize ist deaktiviert. Dieser Agent arbeitet als read-only Incident-Reporter und schreibt Berichte statt Änderungen auszuführen.",
+                "tool_results": []
             }
 
     # -------- FALLBACK: LLM MODE --------
     max_tool_calls = 10
     current_input = user_input
     conversation_history = []
+
+    if handoff_context:
+        conversation_history.append(("handoff", handoff_context))
 
     for _ in range(max_tool_calls):
         reply = agent.query(current_input, extra_context=conversation_history)
@@ -551,7 +1289,7 @@ async def chat(req: ChatRequest):
         matches = re.findall(tool_pattern, reply, re.DOTALL)
 
         if not matches:
-            return {"reply": reply, "tool_results": []}
+            return {"reply": reply, "message": reply, "content": reply, "tool_results": [], "ok": True}
 
         tool_results = []
         for match in matches:
@@ -578,7 +1316,7 @@ async def chat(req: ChatRequest):
         current_input = "Die folgenden Tools wurden ausgeführt und haben diese Ergebnisse geliefert:\n"
         for tr in tool_results:
             current_input += f"\nTool: {tr['tool']} {tr['params']}\nOutput:\n{tr['output']}\n"
-        current_input += "\nBitte fahre mit der Optimierung fort oder gib eine Antwort."
+        current_input += "\nBitte schreibe jetzt einen strukturierten Incident-Report auf Basis der verifizierten Tool-Ergebnisse. Keine Optimierung, keine Änderungen, markiere Unsicherheit klar als nicht verifiziert."
 
     return {
         "reply": reply,
@@ -586,12 +1324,25 @@ async def chat(req: ChatRequest):
         "warning": "Maximale Anzahl Tool-Aufrufe erreicht."
     }
 
-@app.get("/terminal")
-async def terminal(cmd: str, repo: str = "brain"):
-    cwd = REPO_PATHS.get(repo, REPO_PATHS["brain"])
-    output = run_command(cmd, cwd)
-    log_message(f"TERMINAL: {repo} $ {cmd} -> {output[:200]}")
-    return {"output": output}
+class TerminalRequest(BaseModel):
+    cmd: Optional[str] = None
+    command: Optional[str] = None
+    repo: Optional[str] = None
+
+@app.api_route("/api/terminal", methods=["GET", "POST"])
+@app.api_route("/command", methods=["GET", "POST"])
+@app.api_route("/terminal", methods=["GET", "POST"])
+async def terminal(cmd: Optional[str] = None, repo: str = "brain", req: Optional[TerminalRequest] = None):
+    effective_cmd = (cmd or (req.cmd if req else None) or (req.command if req else None) or "").strip()
+    effective_repo = (((req.repo if req else None) or repo) or "brain").strip()
+    cwd = REPO_PATHS.get(effective_repo, REPO_PATHS["brain"])
+
+    if not effective_cmd:
+        return {"output": "", "reply": "Kein Befehl übergeben", "ok": False, "repo": effective_repo}
+
+    output = run_command(effective_cmd, cwd)
+    log_message(f"TERMINAL: {effective_repo} $ {effective_cmd} -> {output[:200]}")
+    return {"output": output, "reply": output, "log": output, "ok": True, "repo": effective_repo, "cmd": effective_cmd}
 
 
 class OptimizeRequest(BaseModel):
@@ -604,12 +1355,9 @@ class OptimizeRequest(BaseModel):
 
 @app.post("/optimize")
 async def optimize(req: OptimizeRequest):
-    repo = req.repo
-    max_iter = req.max_iterations
-    cwd = REPO_PATHS.get(repo)
-
-    if not cwd:
-        return {"error": f"Repo '{repo}' nicht bekannt."}
+    return {
+        "warning": "Optimize ist deaktiviert. Dieser Agent arbeitet als read-only Incident-Reporter und schreibt Berichte statt Änderungen auszuführen."
+    }
 
     results = {
         "linter": {"success": False, "iterations": 0, "log": ""},
@@ -699,108 +1447,504 @@ Antwort nur als ```file Blöcke.
 
 
 
-## 5. **Fehlerbehandlung in den API-Request-Funktionen**  
-##Problem: Bei Netzwerkfehlern könnten Exceptions auftreten.  
-##Lösung: Ersetze die Funktionen `vercel_request` und `render_request` durch robuste Versionen mit `try/except`.
-
-### Einfügen: Ersetze die beiden Funktionen.
-
-#python
-def vercel_request(endpoint: str, api_token: str, method="GET", data=None):
-    import requests
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    url = f"https://api.vercel.com/{endpoint}"
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            resp = requests.post(url, headers=headers, json=data, timeout=30)
-        else:
-            return "Unsupported method"
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.RequestException as e:
-        return f"Fehler bei Vercel-API: {e}"
-def render_request(endpoint: str, api_token: str, method="GET", data=None):
-    import requests
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    url = f"https://api.render.com/{endpoint}"
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            resp = requests.post(url, headers=headers, json=data, timeout=30)
-        else:
-            return "Unsupported method"
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.RequestException as e:
-        return f"Fehler bei Render-API: {e}"        
-
-    
+@app.get("/api/logs")
+@app.get("/api/log")
+@app.get("/logs")
 @app.get("/log")
 async def get_log():
     try:
-        with open(LOG_FILE, "r") as f:
-            lines = f.readlines()[-100:]  # letzte 100 Zeilen
-        return {"log": "".join(lines)}
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f.readlines()]
+        tail_lines = lines[-200:]
+        return {
+            "log": "\n".join(tail_lines),
+            "lines": tail_lines,
+            "total_lines": len(lines)
+        }
     except Exception as e:
-        return {"log": f"Log file not readable: {e}"}
+        return {
+            "log": f"Log file not readable: {e}",
+            "lines": [],
+            "total_lines": 0
+        }
+
+@app.get("/api/health")
+@app.get("/health")
+async def health():
+    _ensure_handoff_dir()
+    model_name = os.getenv("EFRO_AGENT_MODEL", "qwen2.5-coder:7b")
+    handoff_count = len(list_handoff_records(limit=100))
+
+    return {
+        "status": "ok",
+        "service": "efro-agent",
+        "time": datetime.now().isoformat(),
+        "model": model_name,
+        "handoff_dir": HANDOFF_DIR,
+        "handoff_dir_exists": os.path.isdir(HANDOFF_DIR),
+        "handoff_count": handoff_count,
+        "repos": sorted(REPO_PATHS.keys()),
+    }
 
 @app.get("/")
-async def root():
+@app.get("/handoff/{handoff_id}")
+async def root(handoff_id: Optional[str] = None):
     html = '''<!DOCTYPE html>
-<html>
+<html lang="de">
 <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Efro Agent</title>
     <style>
-        body { font-family: sans-serif; display: flex; margin: 0; }
-        #chat { width: 60%; border-right: 1px solid #ccc; padding: 10px; display: flex; flex-direction: column; height: 100vh; }
-        #terminal { width: 40%; padding: 10px; background: #1e1e1e; color: #d4d4d4; font-family: monospace; overflow-y: auto; height: 100vh; }
-        #messages { flex: 1; overflow-y: auto; border-bottom: 1px solid #ccc; margin-bottom: 10px; }
-        .message { margin: 8px; padding: 6px; border-radius: 8px; max-width: 90%; word-wrap: break-word; }
-        .user { background: #007acc; color: white; align-self: flex-end; }
-        .assistant { background: #f1f1f1; color: black; align-self: flex-start; }
-        .tool { background: #2ecc71; color: white; align-self: flex-start; font-family: monospace; }
-        .system { background: #f39c12; color: white; align-self: flex-start; font-family: monospace; }
-        #status { background: #34495e; color: white; padding: 5px; margin-bottom: 10px; border-radius: 4px; font-size: 12px; text-align: center; }
-        #input-area { display: flex; }
-        #message-input { flex: 1; padding: 8px; }
-        button { padding: 8px; }
-        .command-output { background: #2d2d2d; color: #ccc; padding: 5px; margin-top: 5px; font-family: monospace; white-space: pre-wrap; }
+        :root {
+            color-scheme: dark;
+            --bg: #0b1020;
+            --panel: #121934;
+            --panel-2: #172040;
+            --panel-3: #1e2748;
+            --border: #283355;
+            --text: #e8ecf8;
+            --muted: #9ca9cf;
+            --accent: #87b3ff;
+            --accent-2: #3dd9b0;
+            --danger: #d64545;
+            --warning: #d9822b;
+            --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+        }
+
+        * { box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            margin: 0;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(180deg, #0b1020 0%, #0d1327 100%);
+            color: var(--text);
+        }
+
+        .app-shell {
+            min-height: 100vh;
+            padding: 20px;
+            display: grid;
+            grid-template-rows: auto 1fr;
+            gap: 18px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 14px;
+            padding: 16px 18px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(18, 25, 52, 0.9);
+            box-shadow: var(--shadow);
+        }
+
+        .title-wrap h1 {
+            margin: 0;
+            font-size: 20px;
+            line-height: 1.15;
+        }
+
+        .title-wrap p {
+            margin: 6px 0 0;
+            color: var(--muted);
+            font-size: 13px;
+            max-width: 760px;
+        }
+
+        .status-cluster {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .status-badge,
+        .meta-pill {
+            border: 1px solid var(--border);
+            background: var(--panel-3);
+            border-radius: 999px;
+            padding: 7px 11px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .status-badge.ready { color: #b8ffd6; border-color: rgba(61, 217, 176, 0.35); }
+        .status-badge.thinking { color: #d7e3ff; border-color: rgba(124, 156, 255, 0.35); }
+        .status-badge.error { color: #ffd4d9; border-color: rgba(255, 107, 122, 0.35); }
+
+        .main-grid {
+            min-height: 0;
+            display: grid;
+            grid-template-columns: minmax(420px, 1.25fr) minmax(340px, 0.75fr);
+            gap: 16px;
+        }
+
+        .panel {
+            min-height: 0;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(18, 25, 52, 0.92);
+            box-shadow: var(--shadow);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 14px 16px 12px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .panel-title {
+            margin: 0;
+            font-size: 14px;
+        }
+
+        .panel-subtitle {
+            margin: 4px 0 0;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .messages {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 9px;
+        }
+
+        .message {
+            max-width: 90%;
+            padding: 12px 14px;
+            border-radius: 14px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            border: 1px solid transparent;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: rgba(135, 179, 255, 0.14);
+            border-color: rgba(135, 179, 255, 0.26);
+            color: #eaf1ff;
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--border);
+            color: var(--text);
+        }
+
+        .message.tool {
+            align-self: flex-start;
+            background: rgba(61, 217, 176, 0.10);
+            border-color: rgba(61, 217, 176, 0.20);
+            color: #d8fff4;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        .message.system {
+            align-self: flex-start;
+            background: rgba(217, 130, 43, 0.10);
+            border-color: rgba(217, 130, 43, 0.20);
+            color: #ffe7c2;
+        }
+
+        .composer {
+            border-top: 1px solid var(--border);
+            padding: 13px 15px 15px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            background: rgba(30, 39, 72, 0.45);
+        }
+
+        .text-input,
+        .command-input,
+        .repo-select {
+            width: 100%;
+            border: 1px solid var(--border);
+            background: var(--panel-3);
+            color: var(--text);
+            border-radius: 12px;
+            padding: 12px 14px;
+            outline: none;
+            font-size: 14px;
+        }
+
+        .button-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 1px solid var(--border);
+            background: var(--panel-2);
+            color: var(--text);
+            border-radius: 12px;
+            padding: 10px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            border-color: rgba(135, 179, 255, 0.35);
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        button.primary {
+            background: rgba(135, 179, 255, 0.12);
+            border-color: rgba(135, 179, 255, 0.24);
+            color: #dce8ff;
+        }
+
+        button.ghost {
+            background: transparent;
+        }
+
+        .terminal-wrap {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .terminal-toolbar {
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            background: rgba(30, 39, 72, 0.24);
+        }
+
+        .terminal-controls,
+        .terminal-toggles {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .toggle {
+            display: inline-flex;
+            gap: 8px;
+            align-items: center;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .terminal-output {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 16px 18px 20px;
+            background: rgba(11, 16, 32, 0.72);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .terminal-line {
+            margin: 0 0 8px;
+            padding: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: #dbe4ff;
+        }
+
+        .terminal-line.command {
+            color: #9dc1ff;
+        }
+
+        .terminal-line.muted {
+            color: var(--muted);
+        }
+
+        .terminal-footer {
+            border-top: 1px solid var(--border);
+            padding: 14px 16px 16px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto auto;
+            gap: 9px;
+            background: rgba(30, 39, 72, 0.45);
+        }
+
+        .empty-state {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .handoff-panel {
+            margin: 0 18px 0;
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(18, 25, 52, 0.58);
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .handoff-panel-title {
+            margin: 0;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .handoff-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .handoff-item {
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: rgba(11, 16, 32, 0.68);
+            padding: 12px;
+            text-decoration: none;
+            color: var(--text);
+            transition: border-color 0.12s ease, transform 0.12s ease;
+        }
+
+        .handoff-item:hover {
+            border-color: rgba(135, 179, 255, 0.24);
+            transform: none;
+        }
+
+        .handoff-item.active {
+            border-color: rgba(61, 217, 176, 0.28);
+            box-shadow: inset 0 0 0 1px rgba(61, 217, 176, 0.12);
+        }
+
+        .handoff-item-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+
+        .handoff-item-title {
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .handoff-item-meta {
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        .handoff-item-summary {
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.45;
+        }
+
+        @media (max-width: 1100px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
-<body>
-<div id="chat">
-    <h3>Efro Agent – Chat</h3>
-    <div id="status">Bereit</div>
-    <div id="messages"></div>
-    <div id="input-area">
-        <input type="text" id="message-input" placeholder="Nachricht...">
-        <button id="send-btn">Senden</button>
-    </div>
-</div>
-<div id="terminal">
-    <h3>Terminal</h3>
-    <div id="terminal-output"></div>
-    <div style="margin-top: 10px;">
-        <input type="text" id="cmd-input" placeholder="Befehl...">
-        <button id="run-cmd">Ausführen</button>
-        <select id="repo-select">
-            <option value="efro">efro (Landing Page)</option>
-            <option value="brain">Brain API</option>
-            <option value="widget">Widget (Avatar)</option>
-            <option value="shopify">Shopify App</option>
-        </select>
-    </div>
-</div>
+<body data-handoff-id="__HANDOFF_ID__">
+<div class="app-shell">
+    <header class="topbar">
+        <div class="title-wrap">
+            <h1>EFRO Agent Control Surface</h1>
+            <p>Operator-Assistenz für Repos, Incidents und technische Prüfung.</p>
+        </div>
+        <div class="status-cluster">
+            <div id="status" class="status-badge ready">Bereit</div>
+            <div id="runtime-pill" class="meta-pill">Lade Runtime…</div>
+            <div id="handoff-pill" class="meta-pill" style="display:none;"></div>
+            <div class="meta-pill">UI Fokus: ruhig, lesbar, operativ</div>
+        </div>
+    </header>
 
+    <main class="main-grid">
+        <section class="panel">
+            <div class="panel-header">
+                <div>
+                    <h2 class="panel-title">Chat</h2>
+                    <p class="panel-subtitle">Nachrichten, Tool-Ergebnisse und Agent-Antworten</p>
+                </div>
+            </div>
+            <div class="handoff-panel">
+                <h3 class="handoff-panel-title">Letzte Handoffs</h3>
+                <div id="handoff-list" class="handoff-list">
+                    <div class="empty-state">Noch keine Handoffs geladen.</div>
+                </div>
+            </div>
+            <div id="messages" class="messages">
+                <div class="empty-state">Noch keine Unterhaltung. Starte mit einer Nachricht, prüfe Handoffs oder nutze rechts einen direkten Repo-Befehl für eine technische Sichtung.</div>
+            </div>
+            <div class="composer">
+                <input type="text" id="message-input" class="text-input" placeholder="Nachricht an den Agenten...">
+                <button id="send-btn" class="primary">Senden</button>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-header">
+                <div>
+                    <h2 class="panel-title">Terminal & Logs</h2>
+                    <p class="panel-subtitle">Stabile Log-Ansicht ohne komplettes Rebuild bei jedem Poll</p>
+                </div>
+            </div>
+
+            <div class="terminal-wrap">
+                <div class="terminal-toolbar">
+                    <div class="terminal-controls">
+                        <select id="repo-select" class="repo-select">
+                            <option value="efro">efro · Landing Page</option>
+                            <option value="brain">brain · API</option>
+                            <option value="widget">widget · Avatar</option>
+                            <option value="shopify">shopify · App</option>
+                        </select>
+                        <button id="clear-terminal" class="ghost">Clear Terminal</button>
+                        <button id="copy-terminal" class="ghost">Copy Logs</button>
+                    </div>
+                    <div class="terminal-toggles">
+                        <label class="toggle"><input type="checkbox" id="autoscroll-toggle" checked> Autoscroll</label>
+                        <label class="toggle"><input type="checkbox" id="pause-logs-toggle"> Pause Logs</label>
+                        <div id="log-meta" class="meta-pill">0 Zeilen</div>
+                    </div>
+                </div>
+
+                <div id="terminal-output" class="terminal-output">
+                    <div class="empty-state">Noch keine Log-Ausgabe geladen.</div>
+                </div>
+
+                <div class="terminal-footer">
+                    <input type="text" id="cmd-input" class="command-input" placeholder="Befehl eingeben...">
+                    <button id="run-cmd">Ausführen</button>
+                    <button id="refresh-logs" class="ghost">Logs aktualisieren</button>
+                </div>
+            </div>
+        </section>
+    </main>
+</div>
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {
@@ -812,27 +1956,163 @@ document.addEventListener('DOMContentLoaded', () => {
     const runCmdBtn = document.getElementById('run-cmd');
     const repoSelect = document.getElementById('repo-select');
     const statusDiv = document.getElementById('status');
+    const clearTerminalBtn = document.getElementById('clear-terminal');
+    const copyTerminalBtn = document.getElementById('copy-terminal');
+    const refreshLogsBtn = document.getElementById('refresh-logs');
+    const autoscrollToggle = document.getElementById('autoscroll-toggle');
+    const pauseLogsToggle = document.getElementById('pause-logs-toggle');
+    const logMeta = document.getElementById('log-meta');
+    const handoffId = document.body.dataset.handoffId;
+    const runtimePill = document.getElementById('runtime-pill');
+    const handoffPill = document.getElementById('handoff-pill');
+    const handoffList = document.getElementById('handoff-list');
+
+    let terminalInitialized = false;
+    let lastRenderedLineCount = 0;
+
+    function renderRecentHandoffs(items) {
+        if (!handoffList) return;
+
+        if (!items || items.length === 0) {
+            handoffList.innerHTML = '<div class="empty-state">Noch keine Handoffs vorhanden.</div>';
+            return;
+        }
+
+        handoffList.innerHTML = '';
+        for (const item of items) {
+            const card = document.createElement('a');
+            card.className = `handoff-item ${item.handoff_id === handoffId ? 'active' : ''}`.trim();
+            card.href = `/handoff/${encodeURIComponent(item.handoff_id)}`;
+
+            const summary = (item.summary || 'Keine Zusammenfassung').trim();
+            const shortSummary = summary.length > 140 ? `${summary.slice(0, 137)}...` : summary;
+
+            const header = document.createElement('div');
+            header.className = 'handoff-item-header';
+
+            const title = document.createElement('div');
+            title.className = 'handoff-item-title';
+            title.textContent = item.incident_id || 'Unbekannter Incident';
+
+            const metaRight = document.createElement('div');
+            metaRight.className = 'handoff-item-meta';
+            metaRight.textContent = `${item.priority || 'n/a'} · ${item.severity || 'n/a'}`;
+
+            header.appendChild(title);
+            header.appendChild(metaRight);
+
+            const metaLine = document.createElement('div');
+            metaLine.className = 'handoff-item-meta';
+            metaLine.textContent = `${item.shop_domain || 'kein Shop'} · ${item.likely_repo || 'kein Repo'} / ${item.likely_subsystem || 'kein Subsystem'}`;
+
+            const summaryLine = document.createElement('div');
+            summaryLine.className = 'handoff-item-summary';
+            summaryLine.textContent = shortSummary;
+
+            card.appendChild(header);
+            card.appendChild(metaLine);
+            card.appendChild(summaryLine);
+            handoffList.appendChild(card);
+        }
+    }
+
+    async function loadRecentHandoffs() {
+        if (!handoffList) return;
+
+        try {
+            const resp = await fetch('/api/handoffs?limit=8');
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            renderRecentHandoffs(data.items || []);
+        } catch (err) {
+            handoffList.innerHTML = `<div class="empty-state">Handoffs konnten nicht geladen werden: ${err.message}</div>`;
+        }
+    }
+
+    async function loadHealthStatus() {
+        if (!runtimePill) return;
+
+        try {
+            const resp = await fetch('/health');
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            runtimePill.innerText = `Runtime · ${data.model || 'n/a'} · Handoffs ${data.handoff_count ?? 'n/a'}`;
+        } catch (err) {
+            runtimePill.innerText = `Runtime Fehler · ${err.message}`;
+        }
+    }
+
+    async function loadHandoffContext() {
+        if (!handoffId) return;
+
+        try {
+            const resp = await fetch(`/api/handoff/${encodeURIComponent(handoffId)}`);
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+
+            const packet = await resp.json();
+            handoffPill.style.display = 'inline-flex';
+            handoffPill.innerText = `Handoff · ${packet.handoff_id}`;
+
+            clearEmptyState(messagesDiv);
+            addMessage('system', `Handoff geladen\n\nIncident: ${packet.incident_id}\nShop: ${packet.shop_domain}\nPriorität: ${packet.priority}\nSeverity: ${packet.severity}\nScope: ${packet.scope}\nRepo: ${packet.likely_repo}\nSubsystem: ${packet.likely_subsystem}`);
+            addMessage('assistant', `Zusammenfassung:\n${packet.summary}\n\nTop Findings:\n- ${(packet.top_findings || []).join('\\n- ') || 'Keine Angaben'}\n\nChecks Run:\n- ${(packet.checks_run || []).join('\\n- ') || 'Keine Angaben'}\n\nNächste empfohlene Aktion:\n${packet.recommended_next_action}`);
+            messageInput.value = `Untersuche Handoff ${packet.handoff_id} für ${packet.shop_domain} im Repo ${packet.likely_repo}. Starte mit einer verifizierten Triage.`;
+            setStatus('ready', 'Handoff geladen');
+        } catch (err) {
+            handoffPill.style.display = 'inline-flex';
+            handoffPill.innerText = `Handoff Fehler`;
+            addMessage('system', `Handoff konnte nicht geladen werden: ${err.message}`);
+            setStatus('error', 'Handoff Fehler');
+        }
+    }
+
+    function setStatus(state, label) {
+        statusDiv.className = `status-badge ${state}`;
+        statusDiv.innerText = label;
+    }
+
+    function clearEmptyState(container) {
+        const empty = container.querySelector('.empty-state');
+        if (empty) empty.remove();
+    }
 
     function addMessage(role, text, extraClass = '') {
+        clearEmptyState(messagesDiv);
         const msgDiv = document.createElement('div');
-        msgDiv.className = `message ${role} ${extraClass}`;
+        msgDiv.className = `message ${role} ${extraClass}`.trim();
         msgDiv.innerText = text;
         messagesDiv.appendChild(msgDiv);
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
-    function addTerminalOutput(text) {
+    function appendTerminalLine(text, extraClass = '') {
+        clearEmptyState(terminalDiv);
         const pre = document.createElement('pre');
+        pre.className = `terminal-line ${extraClass}`.trim();
         pre.innerText = text;
         terminalDiv.appendChild(pre);
-        terminalDiv.scrollTop = terminalDiv.scrollHeight;
+        if (autoscrollToggle.checked) {
+            terminalDiv.scrollTop = terminalDiv.scrollHeight;
+        }
+    }
+
+    function resetTerminal() {
+        terminalDiv.innerHTML = '<div class="empty-state">Terminal geleert. Neue Log-Zeilen erscheinen hier automatisch.</div>';
+        terminalInitialized = true;
+        logMeta.innerText = 'Ansicht geleert';
     }
 
     async function sendMessage() {
         const msg = messageInput.value.trim();
         if (!msg) return;
 
-        statusDiv.innerText = 'Agent denkt nach...';
+        setStatus('thinking', 'Agent denkt nach');
         addMessage('user', msg);
         messageInput.value = '';
 
@@ -840,31 +2120,32 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: msg })
+                body: JSON.stringify({ message: msg, handoff_id: handoffId || null })
             });
 
             const data = await response.json();
 
             if (data.tool_results && data.tool_results.length > 0) {
                 for (const tr of data.tool_results) {
-                    addMessage('system', `🔧 Tool: ${tr.tool} ${tr.params.join(' ')}`, 'tool');
-                    addMessage('system', tr.output, 'tool');
+                    addMessage('tool', `🔧 Tool: ${tr.tool} ${tr.params.join(' ')}`);
+                    addMessage('tool', tr.output || 'Keine Tool-Ausgabe');
                 }
             }
 
             if (data.reply) {
                 addMessage('assistant', data.reply);
+                setStatus('ready', 'Bereit');
             } else if (data.warning) {
-                addMessage('system', data.warning, 'system');
+                addMessage('system', data.warning);
+                setStatus('error', 'Warnung');
             } else {
-                addMessage('system', 'Keine gültige Antwort vom Server', 'system');
+                addMessage('system', 'Keine gültige Antwort vom Server');
+                setStatus('error', 'Fehler');
             }
-
-            statusDiv.innerText = 'Bereit';
         } catch (err) {
             console.error('SEND ERROR:', err);
-            addMessage('system', `Fehler: ${err.message}`, 'system');
-            statusDiv.innerText = 'Fehler';
+            addMessage('system', `Fehler: ${err.message}`);
+            setStatus('error', 'Fehler');
         }
     }
 
@@ -873,33 +2154,53 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!cmd) return;
 
         const repo = repoSelect.value;
-        addTerminalOutput(`> ${cmd} (in ${repo})`);
+        appendTerminalLine(`> ${cmd} (in ${repo})`, 'command');
 
         try {
             const response = await fetch(`/terminal?cmd=${encodeURIComponent(cmd)}&repo=${encodeURIComponent(repo)}`);
             const data = await response.json();
-            addTerminalOutput(data.output);
+            appendTerminalLine(data.output || 'Keine Ausgabe');
         } catch (err) {
-            addTerminalOutput(`Fehler: ${err.message}`);
+            appendTerminalLine(`Fehler: ${err.message}`);
         }
 
         cmdInput.value = '';
     }
 
-    async function fetchLogs() {
+    async function fetchLogs(force = false) {
+        if (pauseLogsToggle.checked && !force) return;
+
         try {
             const resp = await fetch('/log');
             const data = await resp.json();
+            const lines = Array.isArray(data.lines) ? data.lines : [];
 
-            if (data.log !== undefined) {
+            logMeta.innerText = `${data.total_lines || lines.length} Zeilen`;
+
+            if (!terminalInitialized) {
                 terminalDiv.innerHTML = '';
-                const lines = data.log.split('\\n');
                 for (const line of lines) {
-                    if (line.trim()) {
-                        addTerminalOutput(line);
-                    }
+                    if (line.trim()) appendTerminalLine(line);
                 }
+                terminalInitialized = true;
+                lastRenderedLineCount = lines.length;
+                return;
             }
+
+            if (lines.length < lastRenderedLineCount) {
+                terminalDiv.innerHTML = '';
+                for (const line of lines) {
+                    if (line.trim()) appendTerminalLine(line);
+                }
+                lastRenderedLineCount = lines.length;
+                return;
+            }
+
+            const newLines = lines.slice(lastRenderedLineCount);
+            for (const line of newLines) {
+                if (line.trim()) appendTerminalLine(line);
+            }
+            lastRenderedLineCount = lines.length;
         } catch (err) {
             console.error('Log-Fehler:', err);
         }
@@ -907,6 +2208,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     sendBtn.onclick = sendMessage;
     runCmdBtn.onclick = runCommand;
+    clearTerminalBtn.onclick = resetTerminal;
+    copyTerminalBtn.onclick = async () => {
+        try {
+            await navigator.clipboard.writeText(terminalDiv.innerText || '');
+            appendTerminalLine('[info] Logs in die Zwischenablage kopiert.', 'muted');
+        } catch (err) {
+            appendTerminalLine(`[warn] Copy fehlgeschlagen: ${err.message}`, 'muted');
+        }
+    };
+    refreshLogsBtn.onclick = () => fetchLogs(true);
 
     messageInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') sendMessage();
@@ -916,14 +2227,22 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.key === 'Enter') runCommand();
     });
 
-    setInterval(fetchLogs, 2000);
-    fetchLogs();
+    setInterval(() => fetchLogs(false), 2000);
+    setInterval(() => loadRecentHandoffs(), 15000);
+    setInterval(() => loadHealthStatus(), 15000);
+    fetchLogs(true);
+    loadRecentHandoffs();
+    loadHealthStatus();
+    loadHandoffContext();
 });
 </script>
 </body>
 </html>'''
+    html = html.replace("__HANDOFF_ID__", handoff_id or "")
     return HTMLResponse(content=html)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    host = os.getenv("EFRO_AGENT_HOST", "127.0.0.1")
+    port = int(os.getenv("EFRO_AGENT_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)
