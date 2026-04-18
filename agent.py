@@ -16,6 +16,8 @@ from datetime import datetime   # <-- NEU
 
 import threading
 import time
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 load_dotenv()
 
 # --- Logging-Hilfsfunktion ---
@@ -34,6 +36,8 @@ RENDER_TOKEN = os.getenv("RENDER_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ---------- Konfiguration ----------
@@ -270,6 +274,8 @@ WATCHDOG_STATE: dict[str, Any] = {
     "consecutive_failures": {},
     "last_ok_at": {},
     "last_error_at": {},
+    "last_notified_status": {},
+    "last_notified_at": {},
     "thread_started": False,
 }
 
@@ -289,6 +295,62 @@ def _watchdog_public_failure_threshold() -> int:
         return max(1, int(raw))
     except Exception:
         return 3
+
+def _telegram_enabled() -> bool:
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def _send_telegram_message(text: str) -> dict[str, Any]:
+    if not _telegram_enabled():
+        return {"ok": False, "skipped": True, "reason": "telegram_not_configured"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = urllib_parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
+    req = urllib_request.Request(url, data=payload, method="POST")
+
+    try:
+        with urllib_request.urlopen(req, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            ok = 200 <= getattr(response, "status", 200) < 300
+            return {
+                "ok": ok,
+                "status_code": getattr(response, "status", 200),
+                "body": _clip_text(body, 220),
+            }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _build_watchdog_telegram_message(
+    shop_key: str,
+    summary_status: str,
+    failed_checks: list[dict[str, Any]],
+    handoff_record: Optional[HandoffRecord],
+    public_health_consecutive_failures: int,
+    public_failure_threshold: int,
+) -> str:
+    severity = summary_status.upper()
+    lines = [
+        f"EFRO Watchdog {severity}",
+        f"Shop: {shop_key}",
+        f"Zeit: {_watchdog_now()}",
+        f"Fehlerhafte Checks: {len(failed_checks)}",
+        f"Public Health Failures: {public_health_consecutive_failures}/{public_failure_threshold}",
+    ]
+
+    if failed_checks:
+        lines.append("Checks: " + ", ".join(item["check_name"] for item in failed_checks[:5]))
+        lines.append("Nächster Schritt: " + _watchdog_next_action(failed_checks))
+
+    if handoff_record:
+        lines.append(f"Handoff: {handoff_record.handoff_id}")
+
+    return "\n".join(lines)
+
 
 def _watchdog_now() -> str:
     return datetime.now().isoformat()
@@ -626,6 +688,7 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
     with WATCHDOG_LOCK:
         previous_signature = WATCHDOG_STATE["active_failure_signatures"].get(shop_key)
         previous_public_failure_count = int(WATCHDOG_STATE["consecutive_failures"].get(public_key, 0) or 0)
+        previous_notified_status = WATCHDOG_STATE["last_notified_status"].get(shop_key)
 
     public_health_consecutive_failures = previous_public_failure_count + 1 if public_health_failed else 0
 
@@ -648,6 +711,27 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
     else:
         summary_status = "green"
 
+    telegram_should_notify = summary_status in {"yellow", "red"} and (
+        summary_status != previous_notified_status or handoff_record is not None
+    )
+    telegram_sent = False
+    telegram_error = None
+
+    if telegram_should_notify:
+        telegram_result = _send_telegram_message(
+            _build_watchdog_telegram_message(
+                shop_key=shop_key,
+                summary_status=summary_status,
+                failed_checks=incident_failed_checks or observed_failed_checks,
+                handoff_record=handoff_record,
+                public_health_consecutive_failures=public_health_consecutive_failures,
+                public_failure_threshold=public_failure_threshold,
+            )
+        )
+        telegram_sent = bool(telegram_result.get("ok"))
+        if not telegram_sent:
+            telegram_error = telegram_result.get("reason") or telegram_result.get("error") or "unknown_telegram_error"
+
     result = {
         "shop_key": shop_key,
         "shop_domain": os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com",
@@ -664,6 +748,10 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
         "checks": all_checks,
         "handoff_created": handoff_record is not None,
         "handoff_id": handoff_record.handoff_id if handoff_record else None,
+        "telegram_configured": _telegram_enabled(),
+        "telegram_should_notify": telegram_should_notify,
+        "telegram_sent": telegram_sent,
+        "telegram_error": telegram_error,
     }
 
     with WATCHDOG_LOCK:
@@ -677,6 +765,12 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
             WATCHDOG_STATE["last_error_at"][public_key] = result["run_at"]
         else:
             WATCHDOG_STATE["last_ok_at"][public_key] = result["run_at"]
+
+        if telegram_sent:
+            WATCHDOG_STATE["last_notified_status"][shop_key] = summary_status
+            WATCHDOG_STATE["last_notified_at"][shop_key] = result["run_at"]
+        elif summary_status == "green":
+            WATCHDOG_STATE["last_notified_status"].pop(shop_key, None)
 
         if incident_failed_checks:
             WATCHDOG_STATE["active_failure_signatures"][shop_key] = failure_signature
@@ -1053,6 +1147,8 @@ async def get_watchdog_status():
             "consecutive_failures": WATCHDOG_STATE["consecutive_failures"],
             "last_ok_at": WATCHDOG_STATE["last_ok_at"],
             "last_error_at": WATCHDOG_STATE["last_error_at"],
+            "last_notified_status": WATCHDOG_STATE["last_notified_status"],
+            "last_notified_at": WATCHDOG_STATE["last_notified_at"],
             "note": "Antwortqualitätsprüfung ist in dieser ersten Stufe nur kontraktbasiert, nicht voll semantisch.",
         }
 
