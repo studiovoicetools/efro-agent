@@ -508,6 +508,98 @@ def _check_public_health_contract() -> dict[str, Any]:
         )
 
 
+def _check_mcp_stream_disconnects() -> dict[str, Any]:
+    started = time.time()
+    lookback_seconds_raw = os.getenv("EFRO_AGENT_MCP_CONTEXT_CANCELED_LOOKBACK_SECONDS", "300").strip()
+    warn_threshold_raw = os.getenv("EFRO_AGENT_MCP_CONTEXT_CANCELED_WARN_THRESHOLD", "8").strip()
+    error_threshold_raw = os.getenv("EFRO_AGENT_MCP_CONTEXT_CANCELED_ERROR_THRESHOLD", "20").strip()
+
+    try:
+        lookback_seconds = max(60, int(lookback_seconds_raw))
+    except Exception:
+        lookback_seconds = 300
+
+    try:
+        warn_threshold = max(1, int(warn_threshold_raw))
+    except Exception:
+        warn_threshold = 8
+
+    try:
+        error_threshold = max(warn_threshold, int(error_threshold_raw))
+    except Exception:
+        error_threshold = 20
+
+    cmd = [
+        "journalctl",
+        "-u",
+        "caddy.service",
+        "--since",
+        f"-{lookback_seconds} seconds",
+        "--no-pager",
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        matching_lines = [
+            line for line in stdout.splitlines()
+            if '"uri":"/mcp/"' in line and 'reading: context canceled' in line
+        ]
+        disconnect_count = len(matching_lines)
+
+        if completed.returncode != 0:
+            status = "error"
+        elif disconnect_count >= error_threshold:
+            status = "error"
+        elif disconnect_count >= warn_threshold:
+            status = "warn"
+        else:
+            status = "ok"
+
+        evidence = _clip_text(
+            f"returncode={completed.returncode}; disconnect_count={disconnect_count}; lookback_seconds={lookback_seconds}; sample={' || '.join(matching_lines[:2])}; stderr={stderr}",
+            220,
+        )
+        return _run_observation_check(
+            check_name="mcp_stream_disconnects",
+            target="journalctl:caddy.service:/mcp/context-canceled",
+            status=status,
+            kind="technical",
+            evidence=evidence,
+            expected=f"< {warn_threshold} context-canceled events in the last {lookback_seconds} seconds",
+            observed=f"disconnect_count={disconnect_count}; warn_threshold={warn_threshold}; error_threshold={error_threshold}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except subprocess.TimeoutExpired as e:
+        return _run_observation_check(
+            check_name="mcp_stream_disconnects",
+            target="journalctl:caddy.service:/mcp/context-canceled",
+            status="error",
+            kind="technical",
+            evidence=f"timeout={e}",
+            expected="journalctl returns within timeout and disconnect rate stays below thresholds",
+            observed=f"timeout={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="mcp_stream_disconnects",
+            target="journalctl:caddy.service:/mcp/context-canceled",
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="journalctl returns within timeout and disconnect rate stays below thresholds",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
 def _check_handoffs_api_contract() -> dict[str, Any]:
     started = time.time()
     try:
@@ -599,6 +691,7 @@ def _efro_watchdog_checks() -> list[dict[str, Any]]:
     return [
         _check_local_health_contract(),
         _check_public_health_contract(),
+        _check_mcp_stream_disconnects(),
         _check_handoffs_api_contract(),
         _check_chat_status_contract(),
         _check_command_pwd_contract(),
@@ -613,7 +706,7 @@ def _watchdog_failure_signature(failed_checks: list[dict[str, Any]]) -> str:
 
 def _watchdog_severity_and_priority(failed_checks: list[dict[str, Any]]) -> tuple[str, str]:
     failed_names = {item["check_name"] for item in failed_checks}
-    if "local_health" in failed_names or "public_health" in failed_names:
+    if "local_health" in failed_names or "public_health" in failed_names or "mcp_stream_disconnects" in failed_names:
         return ("critical", "P1")
     if any(item["kind"] == "technical" for item in failed_checks):
         return ("high", "P1")
@@ -623,6 +716,8 @@ def _watchdog_subsystem(failed_checks: list[dict[str, Any]]) -> str:
     failed_names = {item["check_name"] for item in failed_checks}
     if "public_health" in failed_names:
         return "caddy-routing"
+    if "mcp_stream_disconnects" in failed_names:
+        return "mcp-stream"
     if "local_health" in failed_names:
         return "agent-runtime"
     if "handoffs_api" in failed_names:
@@ -638,6 +733,8 @@ def _watchdog_next_action(failed_checks: list[dict[str, Any]]) -> str:
 
     if subsystem == "caddy-routing":
         return "Prüfe zuerst öffentliches Routing, Health-Weiterleitung und Caddy-Konfiguration. Danach lokalen Health-Pfad gegen 127.0.0.1:8000 gegentesten."
+    if subsystem == "mcp-stream":
+        return "Prüfe zuerst die Rate von /mcp/-Disconnects in caddy.service, vergleiche sie mit mcp-repo-reader-Logs und sammele Belege, ob der Client die Streams vorzeitig beendet."
     if subsystem == "agent-runtime":
         return "Prüfe zuerst efro-agent.service, lokale /health-Antwort und Prozessstatus auf Port 8000."
     if subsystem == "handoff-api":
