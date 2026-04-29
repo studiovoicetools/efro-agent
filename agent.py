@@ -48,6 +48,7 @@ REPO_PATHS = {
     "shopify": "/opt/efro-agent/repos/efro-shopify"
 }
 HANDOFF_DIR = os.getenv("EFRO_AGENT_HANDOFF_DIR", "/opt/efro-agent/handoffs")
+CONTROL_CENTER_WATCHDOG_URL = os.getenv("EFRO_CONTROL_CENTER_WATCHDOG_URL", "").strip()
 # -----------------------------------
 
 # --- Embedding-Funktion (lokal) ---
@@ -348,6 +349,19 @@ def _build_watchdog_telegram_message(
 
     if handoff_record:
         lines.append(f"Handoff: {handoff_record.handoff_id}")
+
+    if failed_checks:
+        first = failed_checks[0]
+        lines.extend([
+            "",
+            "Kopierbarer Agent-Auftrag:",
+            f"Subsystem: {_watchdog_subsystem(failed_checks)}",
+            f"Check: {first.get('check_name')}",
+            f"Target: {first.get('target')}",
+            f"Observed: {_clip_text(str(first.get('observed') or ''), 280)}",
+            f"Evidence: {_clip_text(str(first.get('evidence') or ''), 420)}",
+            "Arbeite nur auf Branch/Worktree. Keine Secrets ausgeben. Main nicht direkt ändern. Erst Typecheck/Test/Probe grün machen.",
+        ])
 
     return "\n".join(lines)
 
@@ -687,6 +701,63 @@ def _check_command_pwd_contract() -> dict[str, Any]:
         )
 
 
+def _check_control_center_watchdog_contract() -> dict[str, Any]:
+    started = time.time()
+    url = os.getenv("EFRO_CONTROL_CENTER_WATCHDOG_URL", "").strip()
+    if not url:
+        return _run_observation_check(
+            check_name="control_center_watchdog",
+            target="env:EFRO_CONTROL_CENTER_WATCHDOG_URL",
+            status="warn",
+            kind="technical",
+            evidence="not_configured",
+            expected="optional URL configured when Control Center watchdog should be bridged to Telegram",
+            observed="EFRO_CONTROL_CENTER_WATCHDOG_URL empty",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+    try:
+        req = urllib_request.Request(url, method="GET", headers={"Accept": "application/json"})
+        with urllib_request.urlopen(req, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status_code = getattr(response, "status", 200)
+
+        payload = json.loads(body)
+        health = payload.get("health") or {}
+        widget = ((payload.get("widgetBehavior") or {}).get("nonshopifyGreeting") or {})
+        overall_status = str(health.get("status") or "unknown")
+        widget_status = str(widget.get("status") or health.get("widgetProbeStatus") or "unknown")
+        reason = str(widget.get("reason") or ", ".join(health.get("reasons") or []) or "unknown")
+        ok = status_code < 400 and overall_status == "green" and widget_status in {"green", "unknown"}
+        observed = f"http={status_code}; overall={overall_status}; widget={widget_status}; reason={reason}"
+        evidence = _clip_text(json.dumps({
+            "health": health,
+            "widgetBehavior": payload.get("widgetBehavior"),
+        }, ensure_ascii=False), 260)
+
+        return _run_observation_check(
+            check_name="control_center_watchdog",
+            target=url,
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected="Control Center /api/ops/watchdog health.status=green and widget greeting green/unknown",
+            observed=observed,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="control_center_watchdog",
+            target=url,
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="Control Center watchdog reachable and green",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
 def _efro_watchdog_checks() -> list[dict[str, Any]]:
     return [
         _check_local_health_contract(),
@@ -695,6 +766,7 @@ def _efro_watchdog_checks() -> list[dict[str, Any]]:
         _check_handoffs_api_contract(),
         _check_chat_status_contract(),
         _check_command_pwd_contract(),
+        _check_control_center_watchdog_contract(),
     ]
 
 
@@ -726,6 +798,8 @@ def _watchdog_subsystem(failed_checks: list[dict[str, Any]]) -> str:
         return "chat-contract"
     if "command_pwd_contract" in failed_names:
         return "command-contract"
+    if "control_center_watchdog" in failed_names:
+        return "control-center-watchdog"
     return "mixed-runtime"
 
 def _watchdog_next_action(failed_checks: list[dict[str, Any]]) -> str:
@@ -743,6 +817,8 @@ def _watchdog_next_action(failed_checks: list[dict[str, Any]]) -> str:
         return "Prüfe zuerst /api/chat mit status-Prompt und vergleiche die Antwort mit dem erwarteten Read-only-Vertrag."
     if subsystem == "command-contract":
         return "Prüfe zuerst /command mit pwd im brain-Repo und vergleiche die Antwort mit dem erwarteten Disabled-Vertrag."
+    if subsystem == "control-center-watchdog":
+        return "Prüfe zuerst Control Center /api/ops/watchdog. Wenn widgetBehavior.nonshopifyGreeting rot/gelb ist: Repo efro-widget prüfen, Probe-Report lesen, Branch/Worktree nutzen, Typecheck und Probe grün machen. Main nicht direkt ändern."
 
     return "Prüfe zuerst die fehlgeschlagenen Checks, priorisiere technische Fehler vor semantischen Antwortfehlern und dokumentiere nur verifizierte Befunde."
 
