@@ -724,6 +724,413 @@ def _check_brain_live_prod() -> dict[str, Any]:
     )
 
 
+def _brain_smoke_cases() -> list[dict[str, str]]:
+    return [
+        {
+            "case_id": "recommendation_de",
+            "message": "Ich suche ein passendes Produkt. Was empfiehlst du mir?",
+            "expects_product_grounding": "1",
+        },
+        {
+            "case_id": "comparison_de",
+            "message": "Vergleiche bitte zwei passende Produkte und erkläre kurz den Unterschied.",
+            "expects_product_grounding": "1",
+        },
+        {
+            "case_id": "price_de",
+            "message": "Nenne mir ein empfehlenswertes Produkt und worauf ich beim Preis achten soll.",
+            "expects_product_grounding": "1",
+        },
+        {
+            "case_id": "unknown_safe_de",
+            "message": "Erfinde bitte keine Produkte. Wenn du unsicher bist, sage klar, welche Informationen fehlen.",
+            "expects_product_grounding": "0",
+        },
+    ]
+
+
+def _looks_german_answer(text: str) -> bool:
+    value = str(text or "").lower()
+    german_markers = [" der ", " die ", " das ", " und ", " ich ", " du ", " empfehle", " produkt", " preis", " wenn "]
+    padded = f" {value} "
+    return any(marker in padded for marker in german_markers)
+
+
+def _extract_brain_reply_fields(parsed: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    reply_text = str(parsed.get("replyText") or parsed.get("reply") or parsed.get("response") or "")
+    metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+    debug = parsed.get("debug") if isinstance(parsed.get("debug"), dict) else {}
+    return reply_text, metadata, debug
+
+
+def _check_brain_answer_quality_smoke() -> dict[str, Any]:
+    started = time.time()
+    configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
+    configured_base = os.getenv("EFRO_BRAIN_URL", os.getenv("BRAIN_API_URL", "")).strip().rstrip("/")
+    candidate_targets: list[str] = []
+    if configured_target:
+        candidate_targets.append(configured_target)
+    if configured_base:
+        candidate_targets.append(f"{configured_base}/api/brain/chat")
+    candidate_targets.extend([
+        "https://efro-brain.vercel.app/api/brain/chat",
+        "http://127.0.0.1:3010/api/brain/chat",
+        "http://127.0.0.1:3020/api/brain/chat",
+        "http://127.0.0.1:3041/api/brain/chat",
+        "https://brain.avatarsalespro.com/api/brain/chat",
+    ])
+    candidate_targets = list(dict.fromkeys([item for item in candidate_targets if item]))
+    selected_target = candidate_targets[0] if candidate_targets else "none"
+    shop_domain = os.getenv("EFRO_BRAIN_LIVE_PROD_SHOP_DOMAIN", "avatarsalespro-dev.myshopify.com").strip()
+    expected_product_count_raw = os.getenv("EFRO_BRAIN_EXPECTED_PRODUCT_COUNT", "134").strip()
+    min_pass_cases_raw = os.getenv("EFRO_BRAIN_QUALITY_MIN_PASS_CASES", "3").strip()
+    max_case_latency_raw = os.getenv("EFRO_BRAIN_QUALITY_MAX_CASE_LATENCY_MS", "12000").strip()
+
+    try:
+        expected_product_count = max(1, int(expected_product_count_raw))
+    except Exception:
+        expected_product_count = 134
+    try:
+        min_pass_cases = max(1, int(min_pass_cases_raw))
+    except Exception:
+        min_pass_cases = 3
+    try:
+        max_case_latency_ms = max(1000, int(max_case_latency_raw))
+    except Exception:
+        max_case_latency_ms = 12000
+
+    case_results: list[dict[str, Any]] = []
+    selected_target = None
+
+    for target in candidate_targets:
+        target_case_results: list[dict[str, Any]] = []
+        target_hard_failure = False
+
+        for case in _brain_smoke_cases():
+            case_started = time.time()
+            payload = {
+                "message": case["message"],
+                "shopDomain": shop_domain,
+                "sessionId": f"watchdog-brain-quality-{case['case_id']}-{int(time.time())}",
+                "channel": "watchdog",
+                "siteType": "shopify",
+            }
+            try:
+                body = json.dumps(payload).encode("utf-8")
+                req = urllib_request.Request(
+                    target,
+                    data=body,
+                    method="POST",
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                )
+                with urllib_request.urlopen(req, timeout=30) as response:
+                    response_body = response.read().decode("utf-8", errors="replace")
+                    status_code = getattr(response, "status", 200)
+
+                latency_ms = int((time.time() - case_started) * 1000)
+                parsed = json.loads(response_body)
+                reply_text, metadata, debug = _extract_brain_reply_fields(parsed)
+                api_diagnostics = debug.get("apiDiagnostics") if isinstance(debug.get("apiDiagnostics"), dict) else {}
+                candidates = parsed.get("candidates") if isinstance(parsed.get("candidates"), list) else []
+
+                success = parsed.get("success") is True
+                blocked = parsed.get("blocked") is True
+                total_products = metadata.get("totalProducts")
+                db_product_count = api_diagnostics.get("dbProductCount")
+                leaks = _bad_output_leaks(reply_text)
+                reply_len = len(reply_text.strip())
+                german_ok = _looks_german_answer(reply_text)
+                latency_ok = latency_ms <= max_case_latency_ms
+                total_products_ok = isinstance(total_products, int) and total_products >= expected_product_count
+                db_product_count_ok = db_product_count is None or (isinstance(db_product_count, int) and db_product_count >= expected_product_count)
+                product_grounding_required = case.get("expects_product_grounding") == "1"
+                product_grounding_ok = (
+                    not product_grounding_required
+                    or bool(candidates)
+                    or total_products_ok
+                    or bool(re.search(r"\bprodukt\w*\b", reply_text, flags=re.IGNORECASE))
+                )
+
+                case_ok = (
+                    status_code == 200
+                    and success
+                    and not blocked
+                    and reply_len >= 40
+                    and german_ok
+                    and not leaks
+                    and latency_ok
+                    and total_products_ok
+                    and db_product_count_ok
+                    and product_grounding_ok
+                )
+
+                target_case_results.append({
+                    "case_id": case["case_id"],
+                    "status": "ok" if case_ok else "error",
+                    "http": status_code,
+                    "success": success,
+                    "blocked": blocked,
+                    "reply_len": reply_len,
+                    "german_ok": german_ok,
+                    "latency_ms": latency_ms,
+                    "latency_ok": latency_ok,
+                    "totalProducts": total_products,
+                    "dbProductCount": db_product_count,
+                    "leaks": leaks,
+                    "product_grounding_ok": product_grounding_ok,
+                })
+            except Exception as e:
+                target_hard_failure = True
+                target_case_results.append({
+                    "case_id": case["case_id"],
+                    "status": "error",
+                    "exception": str(e),
+                    "latency_ms": int((time.time() - case_started) * 1000),
+                })
+
+        passed_cases = len([item for item in target_case_results if item.get("status") == "ok"])
+        if passed_cases >= min_pass_cases:
+            selected_target = target
+            case_results = target_case_results
+            break
+
+        if not case_results or (not target_hard_failure and passed_cases > len([item for item in case_results if item.get("status") == "ok"])):
+            selected_target = target
+            case_results = target_case_results
+
+    passed_cases = len([item for item in case_results if item.get("status") == "ok"])
+    total_cases = len(case_results)
+    failed_cases = [item for item in case_results if item.get("status") != "ok"]
+    max_latency = max([int(item.get("latency_ms") or 0) for item in case_results] or [0])
+    blocked_count = len([item for item in case_results if item.get("blocked") is True])
+    leak_count = sum(len(item.get("leaks") or []) for item in case_results)
+    grounding_failures = len([item for item in case_results if item.get("product_grounding_ok") is False])
+
+    ok = passed_cases >= min_pass_cases and blocked_count == 0 and leak_count == 0 and grounding_failures == 0
+    evidence = _clip_text(json.dumps({
+        "selected": selected_target,
+        "passed_cases": passed_cases,
+        "total_cases": total_cases,
+        "max_latency_ms": max_latency,
+        "blocked_count": blocked_count,
+        "leak_count": leak_count,
+        "grounding_failures": grounding_failures,
+        "failed_cases": failed_cases[:3],
+    }, ensure_ascii=False), 700)
+
+    return _run_observation_check(
+        check_name="brain_answer_quality_smoke",
+        target=selected_target or ", ".join(candidate_targets[:3]),
+        status="ok" if ok else "error",
+        kind="answer_quality",
+        evidence=evidence,
+        expected=f">={min_pass_cases}/{len(_brain_smoke_cases())} cases pass; German/product-grounded answers; no blocked responses; no bad output leaks; max case latency<={max_case_latency_ms}ms",
+        observed=f"passed={passed_cases}/{total_cases}; max_latency_ms={max_latency}; blocked_count={blocked_count}; leak_count={leak_count}; grounding_failures={grounding_failures}",
+        duration_ms=int((time.time() - started) * 1000),
+    )
+
+
+def _stable_text_hash(text: str) -> str:
+    value = str(text or "").lower()
+    value = re.sub(r"\s+", " ", value).strip()
+    hash_value = 2166136261
+    for char in value:
+        hash_value ^= ord(char)
+        hash_value = (hash_value * 16777619) & 0xFFFFFFFF
+    return f"fnv1a32:{hash_value:08x}"
+
+
+def _extract_sse_json_events(response_text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for block in str(response_text or "").split("\n\n"):
+        for line in block.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                parsed = json.loads(line[6:])
+                if isinstance(parsed, dict):
+                    events.append(parsed)
+            except Exception:
+                continue
+    return events
+
+
+def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
+    started = time.time()
+    widget_base = os.getenv("EFRO_WIDGET_BASE_URL", "https://widget.avatarsalespro.com").strip().rstrip("/")
+    shop_domain = os.getenv("EFRO_BRAIN_LIVE_PROD_SHOP_DOMAIN", "avatarsalespro-dev.myshopify.com").strip()
+    message = os.getenv("EFRO_WIDGET_PARITY_MESSAGE", "Ich suche ein passendes Produkt. Was empfiehlst du mir?").strip()
+    session_id = f"watchdog-widget-parity-{int(time.time())}"
+
+    answer_url = f"{widget_base}/api/nonshopify-answer"
+    tts_url = f"{widget_base}/api/tts-with-visemes"
+    signed_url = f"{widget_base}/api/get-signed-url"
+
+    try:
+        answer_started = time.time()
+        answer_body = json.dumps({
+            "shop": shop_domain,
+            "shopDomain": shop_domain,
+            "message": message,
+            "sessionId": session_id,
+        }).encode("utf-8")
+        answer_req = urllib_request.Request(
+            answer_url,
+            data=answer_body,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with urllib_request.urlopen(answer_req, timeout=35) as response:
+            answer_response_body = response.read().decode("utf-8", errors="replace")
+            answer_status = getattr(response, "status", 200)
+            answer_headers = dict(response.headers.items())
+        answer_latency_ms = int((time.time() - answer_started) * 1000)
+        answer_payload = json.loads(answer_response_body)
+
+        reply_text = str(answer_payload.get("replyText") or "")
+        spoken_text = str(answer_payload.get("spokenText") or "")
+        voice_text = str(answer_payload.get("voiceText") or "")
+        answer_text = str(answer_payload.get("answer") or "")
+        response_text = str(answer_payload.get("response") or "")
+        parity = answer_payload.get("answerParity") if isinstance(answer_payload.get("answerParity"), dict) else {}
+        reply_hash = _stable_text_hash(reply_text)
+        parity_hash = str(parity.get("replyHash") or "")
+        source = str(answer_payload.get("source") or "unknown")
+
+        fields = [reply_text, spoken_text, voice_text, answer_text, response_text]
+        non_empty_fields = [item for item in fields if item.strip()]
+        field_hashes = {_stable_text_hash(item) for item in non_empty_fields}
+        field_agreement = len(non_empty_fields) >= 3 and len(field_hashes) == 1
+        parity_hash_ok = not parity_hash or parity_hash == reply_hash
+        reply_ok = len(reply_text.strip()) >= 40 and not _bad_output_leaks(reply_text)
+
+        tts_started = time.time()
+        tts_body = json.dumps({"text": spoken_text or reply_text, "language": "de"}).encode("utf-8")
+        tts_req = urllib_request.Request(
+            tts_url,
+            data=tts_body,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        )
+        with urllib_request.urlopen(tts_req, timeout=45) as response:
+            tts_response_text = response.read().decode("utf-8", errors="replace")
+            tts_status = getattr(response, "status", 200)
+            tts_headers = dict(response.headers.items())
+        tts_latency_ms = int((time.time() - tts_started) * 1000)
+        tts_events = _extract_sse_json_events(tts_response_text)
+        audio_events = [item for item in tts_events if item.get("type") == "audio" and item.get("data")]
+        viseme_events = [item for item in tts_events if item.get("type") == "visemes"]
+        done_events = [item for item in tts_events if item.get("type") == "done"]
+        viseme_count = 0
+        for item in viseme_events:
+            visemes = item.get("visemes")
+            if isinstance(visemes, list):
+                viseme_count += len(visemes)
+        audio_ok = tts_status == 200 and bool(audio_events)
+        tts_event_contract_ok = bool(audio_events) and bool(viseme_events) and bool(done_events)
+
+        signed_started = time.time()
+        signed_body = json.dumps({
+            "dynamicVariables": {
+                "name": "EFRO",
+                "shop": shop_domain,
+                "shopId": shop_domain,
+                "sessionId": session_id,
+                "sourceKind": "watchdog",
+                "greeting": spoken_text or reply_text,
+            }
+        }).encode("utf-8")
+        signed_req = urllib_request.Request(
+            signed_url,
+            data=signed_body,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json", "Cache-Control": "no-cache"},
+        )
+        with urllib_request.urlopen(signed_req, timeout=25) as response:
+            signed_response_text = response.read().decode("utf-8", errors="replace")
+            signed_status = getattr(response, "status", 200)
+            signed_headers = dict(response.headers.items())
+        signed_latency_ms = int((time.time() - signed_started) * 1000)
+        signed_payload = json.loads(signed_response_text)
+        has_signed_url = isinstance(signed_payload.get("signedUrl"), str) and signed_payload.get("signedUrl", "").startswith("wss://")
+
+        answer_cache_control = str(answer_headers.get("cache-control") or answer_headers.get("Cache-Control") or "")
+        tts_cache_control = str(tts_headers.get("cache-control") or tts_headers.get("Cache-Control") or "")
+        signed_cache_control = str(signed_headers.get("cache-control") or signed_headers.get("Cache-Control") or "")
+        cache_contract_ok = (
+            "no-store" in answer_cache_control.lower()
+            or "no-cache" in answer_cache_control.lower()
+            or source in {"efro_brain", "direct", "efro_import_smoke"}
+        ) and ("no-cache" in tts_cache_control.lower() or "no-store" in tts_cache_control.lower())
+
+        voice_chat_parity_ok = field_agreement and parity_hash_ok and reply_ok
+        voice_runtime_ok = audio_ok and tts_event_contract_ok and has_signed_url
+        lipsync_signal_ok = bool(viseme_events)
+        # Empty viseme arrays are currently tolerated because Mascot natural lipsync runs client-side,
+        # but the event itself must exist so the pipeline can be observed.
+        ok = voice_chat_parity_ok and voice_runtime_ok and lipsync_signal_ok and cache_contract_ok
+
+        evidence = _clip_text(json.dumps({
+            "answer": {
+                "http": answer_status,
+                "latency_ms": answer_latency_ms,
+                "source": source,
+                "reply_len": len(reply_text.strip()),
+                "reply_hash": reply_hash,
+                "parity_hash": parity_hash,
+                "field_agreement": field_agreement,
+                "cache_control": answer_cache_control,
+            },
+            "tts": {
+                "http": tts_status,
+                "latency_ms": tts_latency_ms,
+                "audio_events": len(audio_events),
+                "viseme_events": len(viseme_events),
+                "viseme_count": viseme_count,
+                "done_events": len(done_events),
+                "cache_control": tts_cache_control,
+            },
+            "signed_url": {
+                "http": signed_status,
+                "latency_ms": signed_latency_ms,
+                "has_wss_signed_url": has_signed_url,
+                "cache_control": signed_cache_control,
+            },
+            "verdict": {
+                "voice_chat_parity_ok": voice_chat_parity_ok,
+                "voice_runtime_ok": voice_runtime_ok,
+                "lipsync_signal_ok": lipsync_signal_ok,
+                "cache_contract_ok": cache_contract_ok,
+            },
+        }, ensure_ascii=False), 900)
+
+        return _run_observation_check(
+            check_name="widget_chat_voice_cache_parity",
+            target=widget_base,
+            status="ok" if ok else "error",
+            kind="runtime_parity",
+            evidence=evidence,
+            expected="Widget answer fields agree by hash, spoken/voice text equals chat text, TTS returns audio+viseme+done events, signedUrl starts wss://, cache headers avoid stale runtime responses",
+            observed=(
+                f"field_agreement={field_agreement}; parity_hash_ok={parity_hash_ok}; "
+                f"audio_ok={audio_ok}; viseme_events={len(viseme_events)}; signedUrl={has_signed_url}; "
+                f"cache_contract_ok={cache_contract_ok}; source={source}"
+            ),
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="widget_chat_voice_cache_parity",
+            target=widget_base,
+            status="error",
+            kind="runtime_parity",
+            evidence=f"exception={e}",
+            expected="Widget parity probe completes through answer, TTS/viseme and signed-url endpoints",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
 def _check_mcp_stream_disconnects() -> dict[str, Any]:
     started = time.time()
     lookback_seconds_raw = os.getenv("EFRO_AGENT_MCP_CONTEXT_CANCELED_LOOKBACK_SECONDS", "300").strip()
@@ -999,6 +1406,8 @@ def _efro_watchdog_checks() -> list[dict[str, Any]]:
         _check_public_health_contract(),
         _check_widget_voice_signed_url_prod(),
         _check_brain_live_prod(),
+        _check_brain_answer_quality_smoke(),
+        _check_widget_chat_voice_cache_parity(),
         _check_mcp_stream_disconnects(),
         _check_handoffs_api_contract(),
         _check_chat_status_contract(),
