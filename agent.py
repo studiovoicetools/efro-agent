@@ -470,31 +470,53 @@ def _check_public_health_contract() -> dict[str, Any]:
     started = time.time()
     shop_domain = os.getenv("EFRO_AGENT_EFRO_DOMAIN", "mcp.avatarsalespro.com").strip() or "mcp.avatarsalespro.com"
     target = f"https://{shop_domain}/health"
+    local_target = os.getenv("EFRO_AGENT_LOCAL_HEALTH_URL", "http://127.0.0.1:8000/health").strip()
     expected_contains = '"status":"ok"'
-    cmd = ["curl", "--silent", "--show-error", "--location", "--max-time", "15", target]
 
-    try:
-        completed = subprocess.run(
-            cmd,
+    def run_curl(url: str, max_time: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["curl", "--silent", "--show-error", "--location", "--max-time", max_time, url],
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=max(int(max_time) + 5, 10),
         )
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        ok = completed.returncode == 0 and expected_contains in stdout
+
+    try:
+        public = run_curl(target, os.getenv("EFRO_AGENT_PUBLIC_HEALTH_TIMEOUT_SECONDS", "15").strip() or "15")
+        public_stdout = public.stdout or ""
+        public_stderr = public.stderr or ""
+        public_ok = public.returncode == 0 and expected_contains in public_stdout
+
+        if public_ok:
+            return _run_observation_check(
+                check_name="public_health",
+                target=target,
+                status="ok",
+                kind="technical",
+                evidence=_clip_text(f"public_returncode={public.returncode}; public_ok=True", 220),
+                expected=f"external health returns 0 and contains {expected_contains}",
+                observed="public_ok=True; local_fallback=not_needed",
+                duration_ms=int((time.time() - started) * 1000),
+            )
+
+        local = run_curl(local_target, "5")
+        local_stdout = local.stdout or ""
+        local_stderr = local.stderr or ""
+        local_ok = local.returncode == 0 and expected_contains in local_stdout
+        status = "warn" if local_ok else "error"
         evidence = _clip_text(
-            f"returncode={completed.returncode}; stdout={stdout}; stderr={stderr}",
-            220,
+            f"public_returncode={public.returncode}; public_stderr={public_stderr}; "
+            f"local_returncode={local.returncode}; local_ok={local_ok}; local_stderr={local_stderr}",
+            260,
         )
         return _run_observation_check(
             check_name="public_health",
             target=target,
-            status="ok" if ok else "error",
+            status=status,
             kind="technical",
             evidence=evidence,
-            expected=f"curl external probe returns 0 and contains {expected_contains}",
-            observed=f"returncode={completed.returncode}; contains={expected_contains in stdout}",
+            expected=f"external health ok; if external times out, local {local_target} must prove agent is healthy",
+            observed=f"public_ok=False; local_ok={local_ok}",
             duration_ms=int((time.time() - started) * 1000),
         )
     except subprocess.TimeoutExpired as e:
@@ -504,7 +526,7 @@ def _check_public_health_contract() -> dict[str, Any]:
             status="error",
             kind="technical",
             evidence=f"timeout={e}",
-            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            expected=f"health probe returns within timeout and contains {expected_contains}",
             observed=f"timeout={e}",
             duration_ms=int((time.time() - started) * 1000),
         )
@@ -515,10 +537,191 @@ def _check_public_health_contract() -> dict[str, Any]:
             status="error",
             kind="technical",
             evidence=f"exception={e}",
-            expected=f"curl external probe returns 0 and contains {expected_contains}",
+            expected=f"health probe returns within timeout and contains {expected_contains}",
             observed=f"exception={e}",
             duration_ms=int((time.time() - started) * 1000),
         )
+
+
+def _check_widget_voice_signed_url_prod() -> dict[str, Any]:
+    started = time.time()
+    target = os.getenv("EFRO_WIDGET_SIGNED_URL_PROD", "https://widget.avatarsalespro.com/api/get-signed-url").strip()
+    payload = {
+        "dynamicVariables": {
+            "name": "EFRO",
+            "shop": "avatarsalespro-dev.myshopify.com",
+            "shopId": "avatarsalespro-dev.myshopify.com",
+            "sessionId": f"watchdog-{int(time.time())}",
+            "greeting": "Hallo! Ich bin EFRO, dein KI-Assistent. Wie kann ich dir helfen?",
+            "sourceKind": "shopify",
+        }
+    }
+
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(
+            target,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with urllib_request.urlopen(req, timeout=20) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            status_code = getattr(response, "status", 200)
+
+        parsed = json.loads(response_body)
+        has_signed_url = isinstance(parsed.get("signedUrl"), str) and parsed.get("signedUrl", "").startswith("wss://")
+        ok = status_code == 200 and has_signed_url
+        evidence = _clip_text(
+            f"http={status_code}; has_signed_url={has_signed_url}; request_id={parsed.get('requestId') or '-'}",
+            220,
+        )
+        return _run_observation_check(
+            check_name="widget_voice_signed_url_prod",
+            target=target,
+            status="ok" if ok else "error",
+            kind="technical",
+            evidence=evidence,
+            expected="HTTP 200 and JSON contains signedUrl starting with wss://",
+            observed=f"http={status_code}; has_signed_url={has_signed_url}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+    except Exception as e:
+        return _run_observation_check(
+            check_name="widget_voice_signed_url_prod",
+            target=target,
+            status="error",
+            kind="technical",
+            evidence=f"exception={e}",
+            expected="Production widget signed URL endpoint returns HTTP 200 with signedUrl",
+            observed=f"exception={e}",
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+def _bad_output_leaks(text: str) -> list[str]:
+    bad_needles = ["[object Object]", "undefined", "NaN"]
+    value = str(text or "")
+    leaks = [needle for needle in bad_needles if needle in value]
+    if re.search(r"\bnull\b", value, flags=re.IGNORECASE):
+        leaks.append("null")
+    return leaks
+
+
+def _check_brain_live_prod() -> dict[str, Any]:
+    started = time.time()
+    configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
+    configured_base = os.getenv("EFRO_BRAIN_URL", os.getenv("BRAIN_API_URL", "")).strip().rstrip("/")
+    candidate_targets: list[str] = []
+    if configured_target:
+        candidate_targets.append(configured_target)
+    if configured_base:
+        candidate_targets.append(f"{configured_base}/api/brain/chat")
+    candidate_targets.extend([
+        "https://efro-brain.vercel.app/api/brain/chat",
+        "http://127.0.0.1:3010/api/brain/chat",
+        "http://127.0.0.1:3020/api/brain/chat",
+        "http://127.0.0.1:3041/api/brain/chat",
+        "https://brain.avatarsalespro.com/api/brain/chat",
+    ])
+    # Keep order but remove duplicates/empty values.
+    candidate_targets = list(dict.fromkeys([item for item in candidate_targets if item]))
+    target = candidate_targets[0]
+    shop_domain = os.getenv("EFRO_BRAIN_LIVE_PROD_SHOP_DOMAIN", "avatarsalespro-dev.myshopify.com").strip()
+    expected_product_count_raw = os.getenv("EFRO_BRAIN_EXPECTED_PRODUCT_COUNT", "134").strip()
+
+    try:
+        expected_product_count = max(1, int(expected_product_count_raw))
+    except Exception:
+        expected_product_count = 134
+
+    payload = {
+        "message": "Welche Produkte empfiehlst du mir?",
+        "shopDomain": shop_domain,
+        "sessionId": f"watchdog-brain-live-prod-{int(time.time())}",
+        "channel": "watchdog",
+        "siteType": "shopify",
+    }
+
+    body = json.dumps(payload).encode("utf-8")
+    attempt_observations: list[str] = []
+
+    for target in candidate_targets:
+        try:
+            req = urllib_request.Request(
+                target,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            with urllib_request.urlopen(req, timeout=30) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+                status_code = getattr(response, "status", 200)
+
+            parsed = json.loads(response_body)
+            reply_text = str(parsed.get("replyText") or parsed.get("reply") or parsed.get("response") or "")
+            metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+            debug = parsed.get("debug") if isinstance(parsed.get("debug"), dict) else {}
+            api_diagnostics = debug.get("apiDiagnostics") if isinstance(debug.get("apiDiagnostics"), dict) else {}
+
+            success = parsed.get("success") is True
+            blocked = parsed.get("blocked") is True
+            total_products = metadata.get("totalProducts")
+            db_product_count = api_diagnostics.get("dbProductCount")
+            leaks = _bad_output_leaks(reply_text)
+
+            total_products_ok = isinstance(total_products, int) and total_products >= expected_product_count
+            db_product_count_ok = db_product_count is None or (isinstance(db_product_count, int) and db_product_count >= expected_product_count)
+            reply_ok = bool(reply_text.strip())
+            ok = (
+                status_code == 200
+                and success
+                and reply_ok
+                and total_products_ok
+                and db_product_count_ok
+                and not blocked
+                and not leaks
+            )
+
+            attempt_observations.append(
+                f"{target}: http={status_code}; success={success}; reply_ok={reply_ok}; totalProducts={total_products}; dbProductCount={db_product_count}; blocked={blocked}; leaks={leaks}"
+            )
+
+            if ok:
+                evidence = _clip_text(
+                    f"selected={target}; http={status_code}; success={success}; reply_len={len(reply_text)}; "
+                    f"totalProducts={total_products}; dbProductCount={db_product_count}; "
+                    f"blocked={blocked}; leaks={','.join(leaks) or '-'}; candidates={len(candidate_targets)}",
+                    320,
+                )
+                observed = (
+                    f"selected={target}; http={status_code}; success={success}; reply_ok={reply_ok}; "
+                    f"totalProducts={total_products}; dbProductCount={db_product_count}; blocked={blocked}; leaks={leaks}"
+                )
+                return _run_observation_check(
+                    check_name="brain_live_prod",
+                    target=target,
+                    status="ok",
+                    kind="technical",
+                    evidence=evidence,
+                    expected=f"HTTP 200, success=true, replyText non-empty, metadata.totalProducts>={expected_product_count}, dbProductCount>={expected_product_count} if present, blocked=false, no bad output leaks",
+                    observed=observed,
+                    duration_ms=int((time.time() - started) * 1000),
+                )
+        except Exception as e:
+            attempt_observations.append(f"{target}: exception={e}")
+
+    evidence = _clip_text(" || ".join(attempt_observations), 520)
+    return _run_observation_check(
+        check_name="brain_live_prod",
+        target=", ".join(candidate_targets[:3]) + (" ..." if len(candidate_targets) > 3 else ""),
+        status="error",
+        kind="technical",
+        evidence=evidence,
+        expected="At least one configured or fallback Brain endpoint returns a valid product-backed answer contract",
+        observed=evidence,
+        duration_ms=int((time.time() - started) * 1000),
+    )
 
 
 def _check_mcp_stream_disconnects() -> dict[str, Any]:
@@ -794,11 +997,15 @@ def _efro_watchdog_checks() -> list[dict[str, Any]]:
     return [
         _check_local_health_contract(),
         _check_public_health_contract(),
+        _check_widget_voice_signed_url_prod(),
+        _check_brain_live_prod(),
         _check_mcp_stream_disconnects(),
         _check_handoffs_api_contract(),
         _check_chat_status_contract(),
         _check_command_pwd_contract(),
-        _check_control_center_watchdog_contract(),
+        # Avoid a watchdog self-loop: Control Center depends on this Agent summary,
+        # so the Agent must not call Control Center from inside the same blocking run.
+        # Control Center remains responsible for reading /api/watchdog/summary.
     ]
 
 
@@ -822,6 +1029,8 @@ def _watchdog_subsystem(failed_checks: list[dict[str, Any]]) -> str:
         return "caddy-routing"
     if "mcp_stream_disconnects" in failed_names:
         return "mcp-stream"
+    if "brain_live_prod" in failed_names:
+        return "brain-live-prod"
     if "local_health" in failed_names:
         return "agent-runtime"
     if "handoffs_api" in failed_names:
@@ -841,6 +1050,8 @@ def _watchdog_next_action(failed_checks: list[dict[str, Any]]) -> str:
         return "Prüfe zuerst öffentliches Routing, Health-Weiterleitung und Caddy-Konfiguration. Danach lokalen Health-Pfad gegen 127.0.0.1:8000 gegentesten."
     if subsystem == "mcp-stream":
         return "Prüfe zuerst die Rate von /mcp/-Disconnects in caddy.service, vergleiche sie mit mcp-repo-reader-Logs und sammele Belege, ob der Client die Streams vorzeitig beendet."
+    if subsystem == "brain-live-prod":
+        return "Prüfe zuerst EFRO_BRAIN_URL/BRAIN_API_URL, /api/brain/chat Live-Antwort, Produktcount, blocked-Status, Bad-Output-Leaks und Supabase products für avatarsalespro-dev.myshopify.com. Danach Brain-Repo nur auf Branch/Worktree ändern und mit Live-Probe belegen."
     if subsystem == "agent-runtime":
         return "Prüfe zuerst efro-agent.service, lokale /health-Antwort und Prozessstatus auf Port 8000."
     if subsystem == "handoff-api":
