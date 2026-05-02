@@ -1005,7 +1005,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
         reply_ok = len(reply_text.strip()) >= 40 and not _bad_output_leaks(reply_text)
 
         tts_started = time.time()
-        tts_body = json.dumps({"text": spoken_text or reply_text, "language": "de"}).encode("utf-8")
+        tts_body = json.dumps({"text": spoken_text or reply_text, "language": "de", "shopDomain": shop_domain}).encode("utf-8")
         tts_req = urllib_request.Request(
             tts_url,
             data=tts_body,
