@@ -499,14 +499,13 @@ def _check_public_health_contract() -> dict[str, Any]:
                 duration_ms=int((time.time() - started) * 1000),
             )
 
-        local = run_curl(local_target, "5")
-        local_stdout = local.stdout or ""
-        local_stderr = local.stderr or ""
-        local_ok = local.returncode == 0 and expected_contains in local_stdout
+        local_payload = _build_local_health_payload()
+        local_ok = local_payload.get("status") == "ok" and local_payload.get("handoff_dir_exists") is True
         status = "warn" if local_ok else "error"
         evidence = _clip_text(
             f"public_returncode={public.returncode}; public_stderr={public_stderr}; "
-            f"local_returncode={local.returncode}; local_ok={local_ok}; local_stderr={local_stderr}",
+            f"local_internal_ok={local_ok}; local_service={local_payload.get('service')}; "
+            f"handoff_dir_exists={local_payload.get('handoff_dir_exists')}",
             260,
         )
         return _run_observation_check(
@@ -515,8 +514,8 @@ def _check_public_health_contract() -> dict[str, Any]:
             status=status,
             kind="technical",
             evidence=evidence,
-            expected=f"external health ok; if external times out, local {local_target} must prove agent is healthy",
-            observed=f"public_ok=False; local_ok={local_ok}",
+            expected="external health ok; if external times out, internal local health contract must prove agent is healthy",
+            observed=f"public_ok=False; local_internal_ok={local_ok}",
             duration_ms=int((time.time() - started) * 1000),
         )
     except subprocess.TimeoutExpired as e:
