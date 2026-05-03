@@ -1782,6 +1782,8 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
         }
 
     all_checks = _efro_watchdog_checks()
+    cost_checks_enabled = _costly_watchdog_checks_enabled()
+    cost_sources = _watchdog_cost_manifest() if cost_checks_enabled else []
     observed_failed_checks = [item for item in all_checks if item["status"] == "error"]
     non_public_failed_checks = [item for item in observed_failed_checks if item["check_name"] != "public_health"]
     public_health_failed = any(item["check_name"] == "public_health" for item in observed_failed_checks)
@@ -1810,7 +1812,7 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
 
     if incident_failed_checks:
         summary_status = "red"
-    elif observed_failed_checks:
+    elif observed_failed_checks or cost_checks_enabled:
         summary_status = "yellow"
     else:
         summary_status = "green"
@@ -1819,7 +1821,7 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
         summary_status == "red"
         or (
             summary_status == "yellow"
-            and any(item["check_name"] != "public_health" for item in observed_failed_checks)
+            and (cost_checks_enabled or any(item["check_name"] != "public_health" for item in observed_failed_checks))
         )
     ) and (
         summary_status != previous_notified_status or handoff_record is not None
@@ -1832,7 +1834,7 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
             _build_watchdog_telegram_message(
                 shop_key=shop_key,
                 summary_status=summary_status,
-                failed_checks=incident_failed_checks or observed_failed_checks,
+                failed_checks=incident_failed_checks or observed_failed_checks or ([item for item in all_checks if item.get("check_name") == "watchdog_cost_policy"] if cost_checks_enabled else []),
                 handoff_record=handoff_record,
                 public_health_consecutive_failures=public_health_consecutive_failures,
                 public_failure_threshold=public_failure_threshold,
@@ -1851,6 +1853,10 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
         "summary_status": summary_status,
         "mode": "read-only watchdog",
         "answer_quality_scope": "zero-cost default watchdog: local/public-health/log/contract checks only; provider/LLM/voice/runtime probes require EFRO_ENABLE_COSTLY_WATCHDOG_CHECKS=true",
+        "cost_mode": "costly_checks_enabled" if cost_checks_enabled else "zero_cost",
+        "cost_warning": "Provider/LLM/voice/runtime probes are enabled and may create costs" if cost_checks_enabled else None,
+        "costly_checks_enabled": cost_checks_enabled,
+        "cost_sources": cost_sources,
         "observed_failed_count": len(observed_failed_checks),
         "failed_count": len(incident_failed_checks),
         "public_health_consecutive_failures": public_health_consecutive_failures,
