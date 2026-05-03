@@ -3375,6 +3375,7 @@ async def health():
     }
 
 @app.get("/")
+@app.get("/admin/import")
 @app.get("/handoff/{handoff_id}")
 async def root(handoff_id: Optional[str] = None):
     html = '''<!DOCTYPE html>
@@ -3748,6 +3749,40 @@ async def root(handoff_id: Optional[str] = None):
             line-height: 1.45;
         }
 
+        .pricing-panel {
+            margin: 14px 18px 0;
+            padding: 14px;
+            border: 1px solid rgba(135, 179, 255, 0.22);
+            border-radius: 16px;
+            background: rgba(11, 16, 32, 0.72);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .pricing-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .pricing-card {
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: rgba(18, 25, 52, 0.74);
+            padding: 12px;
+        }
+
+        .pricing-card strong { display: block; margin-bottom: 5px; }
+        .pricing-card small { color: var(--muted); line-height: 1.35; display: block; }
+        .pricing-value { color: #b8ffd6; font-weight: 700; }
+        .pricing-warning { color: #ffe7c2; font-size: 12px; line-height: 1.4; }
+        .pricing-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .pricing-table th, .pricing-table td { border-bottom: 1px solid var(--border); padding: 7px 5px; text-align: left; vertical-align: top; }
+        .pricing-table th { color: var(--muted); font-weight: 600; }
+        .pricing-table td { color: var(--text); }
+        .pricing-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
         @media (max-width: 1100px) {
             .main-grid {
                 grid-template-columns: 1fr;
@@ -3783,6 +3818,25 @@ async def root(handoff_id: Optional[str] = None):
                 <div id="handoff-list" class="handoff-list">
                     <div class="empty-state">Noch keine Handoffs geladen.</div>
                 </div>
+            </div>
+            <div class="pricing-panel">
+                <div>
+                    <h3 class="handoff-panel-title">Kosten & Pakete</h3>
+                    <div class="pricing-warning">Watchdog muss zero-cost bleiben. Live-AI-Minuten und Providerkosten werden getrennt gemessen; die Paketpreise unten sind deine Landingpage-Kalkulation, nicht automatisch aus Testdaten finalisiert.</div>
+                </div>
+                <div id="billing-status" class="pricing-grid">
+                    <div class="pricing-card"><strong>Watchdog</strong><small>Lade Kostenstatus…</small></div>
+                    <div class="pricing-card"><strong>Ledger</strong><small>Lade erfasste Kosten…</small></div>
+                </div>
+                <table class="pricing-table" aria-label="EFRO Pakete">
+                    <thead><tr><th>Paket</th><th>Preis</th><th>Setup</th><th>Live-AI-Minuten</th><th>Overage</th></tr></thead>
+                    <tbody id="pricing-table-body"></tbody>
+                </table>
+                <div class="pricing-actions">
+                    <button id="refresh-pricing" class="ghost">Kosten aktualisieren</button>
+                    <button id="copy-pricing" class="ghost">Kostenübersicht kopieren</button>
+                </div>
+                <div id="pricing-note" class="pricing-warning">Cached Avatar-Replays = fair use inklusive. Live-AI-Minuten = dynamische Gespräche mit Avatar, Chat und Voice.</div>
             </div>
             <div id="messages" class="messages">
                 <div class="empty-state">Noch keine Unterhaltung. Starte mit einer Nachricht, prüfe Handoffs oder nutze rechts einen direkten Repo-Befehl für eine technische Sichtung.</div>
@@ -3854,9 +3908,80 @@ document.addEventListener('DOMContentLoaded', () => {
     const runtimePill = document.getElementById('runtime-pill');
     const handoffPill = document.getElementById('handoff-pill');
     const handoffList = document.getElementById('handoff-list');
+    const billingStatus = document.getElementById('billing-status');
+    const pricingTableBody = document.getElementById('pricing-table-body');
+    const refreshPricingBtn = document.getElementById('refresh-pricing');
+    const copyPricingBtn = document.getElementById('copy-pricing');
+
+    const efroPricingPackages = [
+        { name: 'Pilot', price: '990 € einmalig', setup: 'inkl.', minutes: '14 Tage Pilot', overage: 'Anrechnung auf Growth/Premium' },
+        { name: 'Starter', price: '399 €/Monat', setup: '990 €', minutes: '200 Min.', overage: '0,79 €/Min.' },
+        { name: 'Growth', price: '899 €/Monat', setup: '2.900 €', minutes: '800 Min.', overage: '0,59 €/Min.' },
+        { name: 'Premium', price: '1.790 €/Monat', setup: '5.900 €', minutes: '2.000 Min.', overage: '0,39 €/Min.' },
+        { name: 'Enterprise', price: 'ab 3.500 €/Monat', setup: 'ab 10.000 €', minutes: 'custom / 5.000+ Min.', overage: 'custom' },
+    ];
+
+    let latestPricingSnapshot = '';
 
     let terminalInitialized = false;
     let lastRenderedLineCount = 0;
+
+    function renderPricingPackages() {
+        if (!pricingTableBody) return;
+        pricingTableBody.innerHTML = '';
+        for (const item of efroPricingPackages) {
+            const row = document.createElement('tr');
+            row.innerHTML = `<td><strong>${item.name}</strong></td><td>${item.price}</td><td>${item.setup}</td><td>${item.minutes}</td><td>${item.overage}</td>`;
+            pricingTableBody.appendChild(row);
+        }
+    }
+
+    function renderBillingCards(summary, ledger) {
+        if (!billingStatus) return;
+        const billingMode = summary?.billing_mode || 'unbekannt';
+        const metered = summary?.metered_checks_enabled ? 'JA' : 'Nein';
+        const totalCost = ledger?.summary?.estimated_total_cost ?? 0;
+        const hitRate = ledger?.summary?.cache_hit_rate ?? 0;
+        const missCost = ledger?.summary?.cache_miss_estimated_cost ?? 0;
+        latestPricingSnapshot = [
+            `Watchdog: ${billingMode}`,
+            `Metered Checks aktiv: ${metered}`,
+            `Erfasste Kosten: ${totalCost} ${ledger?.summary?.currency || 'USD'}`,
+            `Cache Hit Rate: ${(hitRate * 100).toFixed(2)}%`,
+            `Cache Miss Kosten: ${missCost} ${ledger?.summary?.currency || 'USD'}`,
+            `Pakete: ${efroPricingPackages.map(p => `${p.name} ${p.price} (${p.minutes})`).join(' | ')}`,
+        ].join('\n');
+        billingStatus.innerHTML = `
+            <div class="pricing-card"><strong>Watchdog</strong><small>Modus: <span class="pricing-value">${billingMode}</span><br>Metered Checks aktiv: <span class="pricing-value">${metered}</span><br>${summary?.billing_warning || 'Keine Kostenwarnung aktiv.'}</small></div>
+            <div class="pricing-card"><strong>Kosten-Ledger</strong><small>Erfasst: <span class="pricing-value">${totalCost} ${ledger?.summary?.currency || 'USD'}</span><br>Cache Hit Rate: <span class="pricing-value">${(hitRate * 100).toFixed(2)}%</span><br>Miss-Kosten: ${missCost} ${ledger?.summary?.currency || 'USD'}</small></div>
+        `;
+    }
+
+    async function loadPricingStatus() {
+        renderPricingPackages();
+        try {
+            const [watchdogResp, ledgerResp] = await Promise.all([
+                fetch('/api/watchdog/summary?shop=efro'),
+                fetch('/api/cost-ledger/summary'),
+            ]);
+            const watchdog = watchdogResp.ok ? await watchdogResp.json() : { billing_mode: `Fehler HTTP ${watchdogResp.status}` };
+            const ledger = ledgerResp.ok ? await ledgerResp.json() : { summary: { estimated_total_cost: 'n/a', currency: 'USD', cache_hit_rate: 0, cache_miss_estimated_cost: 'n/a' } };
+            renderBillingCards(watchdog, ledger);
+        } catch (err) {
+            if (billingStatus) {
+                billingStatus.innerHTML = `<div class="pricing-card"><strong>Kostenstatus Fehler</strong><small>${err.message}</small></div>`;
+            }
+        }
+    }
+
+    async function copyPricingSnapshot() {
+        try {
+            await navigator.clipboard.writeText(latestPricingSnapshot || 'Noch keine Kostenübersicht geladen.');
+            appendTerminalLine('[info] Kostenübersicht in die Zwischenablage kopiert.', 'muted');
+        } catch (err) {
+            appendTerminalLine(`[warn] Kostenübersicht Copy fehlgeschlagen: ${err.message}`, 'muted');
+        }
+    }
 
     function renderRecentHandoffs(items) {
         if (!handoffList) return;
@@ -4106,6 +4231,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
     refreshLogsBtn.onclick = () => fetchLogs(true);
+    if (refreshPricingBtn) refreshPricingBtn.onclick = loadPricingStatus;
+    if (copyPricingBtn) copyPricingBtn.onclick = copyPricingSnapshot;
 
     messageInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') sendMessage();
@@ -4118,9 +4245,11 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => fetchLogs(false), 2000);
     setInterval(() => loadRecentHandoffs(), 15000);
     setInterval(() => loadHealthStatus(), 15000);
+    setInterval(() => loadPricingStatus(), 30000);
     fetchLogs(true);
     loadRecentHandoffs();
     loadHealthStatus();
+    loadPricingStatus();
     loadHandoffContext();
 });
 </script>
