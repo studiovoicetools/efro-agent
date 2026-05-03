@@ -4,7 +4,7 @@ import json
 import ollama
 import re
 from uuid import uuid4
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import chromadb
@@ -48,6 +48,9 @@ REPO_PATHS = {
     "shopify": "/opt/efro-agent/repos/efro-shopify"
 }
 HANDOFF_DIR = os.getenv("EFRO_AGENT_HANDOFF_DIR", "/opt/efro-agent/handoffs")
+COST_LEDGER_DIR = os.getenv("EFRO_AGENT_COST_LEDGER_DIR", "/opt/efro-agent/cost-ledger")
+COST_LEDGER_FILE = os.path.join(COST_LEDGER_DIR, "cost_events.jsonl")
+COST_LEDGER_LOCK = threading.Lock()
 # -----------------------------------
 
 # --- Embedding-Funktion (lokal) ---
@@ -209,8 +212,126 @@ class HandoffCreateResponse(BaseModel):
     packet: HandoffRecord
 
 
+class CostLedgerEvent(BaseModel):
+    shop_domain: str = Field(default="unknown", max_length=255)
+    subsystem: str = Field(default="unknown", max_length=120)
+    endpoint: str = Field(default="unknown", max_length=255)
+    provider: str = Field(default="unknown", max_length=120)
+    operation: str = Field(default="unknown", max_length=160)
+    request_id: str = Field(default_factory=lambda: f"cost_{uuid4().hex[:12]}", max_length=120)
+    session_id: str | None = Field(default=None, max_length=160)
+    cache_key: str | None = Field(default=None, max_length=255)
+    cache_status: str = Field(default="unknown", max_length=40)
+    input_size: int | None = Field(default=None, ge=0)
+    output_size: int | None = Field(default=None, ge=0)
+    tokens_in: int | None = Field(default=None, ge=0)
+    tokens_out: int | None = Field(default=None, ge=0)
+    characters: int | None = Field(default=None, ge=0)
+    estimated_cost: float | None = Field(default=None, ge=0)
+    currency: str = Field(default="USD", max_length=8)
+    observed_status: str = Field(default="unknown", max_length=80)
+    latency_ms: int | None = Field(default=None, ge=0)
+    error: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class CostLedgerRecord(CostLedgerEvent):
+    recorded_at: str
+
+
+class CostLedgerSummary(BaseModel):
+    count: int
+    estimated_total_cost: float
+    currency: str
+    by_provider: dict[str, dict[str, Any]]
+    by_endpoint: dict[str, dict[str, Any]]
+    by_cache_status: dict[str, int]
+    latest: list[dict[str, Any]]
+
+
 def _ensure_handoff_dir():
     os.makedirs(HANDOFF_DIR, exist_ok=True)
+
+
+def _ensure_cost_ledger_dir():
+    os.makedirs(COST_LEDGER_DIR, exist_ok=True)
+
+
+def _is_local_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    return client_host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _cost_ledger_record_from_event(event: CostLedgerEvent) -> CostLedgerRecord:
+    return CostLedgerRecord(**event.model_dump(), recorded_at=datetime.now().isoformat())
+
+
+def append_cost_ledger_event(event: CostLedgerEvent) -> CostLedgerRecord:
+    _ensure_cost_ledger_dir()
+    record = _cost_ledger_record_from_event(event)
+    with COST_LEDGER_LOCK:
+        with open(COST_LEDGER_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record.model_dump(), ensure_ascii=False, sort_keys=True) + "\n")
+    log_message(
+        "COST_LEDGER_APPEND "
+        f"provider={record.provider} endpoint={record.endpoint} shop={record.shop_domain} "
+        f"cache={record.cache_status} estimated_cost={record.estimated_cost} request_id={record.request_id}"
+    )
+    return record
+
+
+def read_cost_ledger_records(limit: int = 250) -> list[dict[str, Any]]:
+    if not os.path.exists(COST_LEDGER_FILE):
+        return []
+    safe_limit = max(1, min(limit, 5000))
+    with COST_LEDGER_LOCK:
+        with open(COST_LEDGER_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-safe_limit:]
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        except Exception:
+            continue
+    return records
+
+
+def _add_cost_bucket(target: dict[str, dict[str, Any]], key: str, record: dict[str, Any]) -> None:
+    bucket_key = key or "unknown"
+    bucket = target.setdefault(bucket_key, {"count": 0, "estimated_cost": 0.0, "tokens_in": 0, "tokens_out": 0, "characters": 0})
+    bucket["count"] += 1
+    bucket["estimated_cost"] += float(record.get("estimated_cost") or 0)
+    bucket["tokens_in"] += int(record.get("tokens_in") or 0)
+    bucket["tokens_out"] += int(record.get("tokens_out") or 0)
+    bucket["characters"] += int(record.get("characters") or 0)
+
+
+def summarize_cost_ledger(limit: int = 250) -> CostLedgerSummary:
+    records = read_cost_ledger_records(limit=limit)
+    by_provider: dict[str, dict[str, Any]] = {}
+    by_endpoint: dict[str, dict[str, Any]] = {}
+    by_cache_status: dict[str, int] = {}
+    total = 0.0
+    for record in records:
+        total += float(record.get("estimated_cost") or 0)
+        _add_cost_bucket(by_provider, str(record.get("provider") or "unknown"), record)
+        _add_cost_bucket(by_endpoint, str(record.get("endpoint") or "unknown"), record)
+        cache_status = str(record.get("cache_status") or "unknown")
+        by_cache_status[cache_status] = by_cache_status.get(cache_status, 0) + 1
+    return CostLedgerSummary(
+        count=len(records),
+        estimated_total_cost=round(total, 8),
+        currency="USD",
+        by_provider=by_provider,
+        by_endpoint=by_endpoint,
+        by_cache_status=by_cache_status,
+        latest=list(reversed(records[-25:])),
+    )
 
 
 def _handoff_file_path(handoff_id: str) -> str:
@@ -2247,6 +2368,32 @@ async def get_handoffs(limit: int = 25):
         "limit": safe_limit,
         "items": records,
     }
+
+
+@app.post("/api/cost-ledger/events")
+async def create_cost_ledger_event(event: CostLedgerEvent, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost ledger writes are local-only")
+    record = append_cost_ledger_event(event)
+    return {"ok": True, "record": record.model_dump()}
+
+
+@app.get("/api/cost-ledger/events")
+async def get_cost_ledger_events(request: Request, limit: int = 100):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost ledger reads are local-only")
+    safe_limit = max(1, min(limit, 1000))
+    records = read_cost_ledger_records(limit=safe_limit)
+    return {"ok": True, "count": len(records), "limit": safe_limit, "items": list(reversed(records))}
+
+
+@app.get("/api/cost-ledger/summary")
+async def get_cost_ledger_summary(request: Request, limit: int = 250):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost ledger summary is local-only")
+    safe_limit = max(1, min(limit, 5000))
+    summary = summarize_cost_ledger(limit=safe_limit)
+    return {"ok": True, "limit": safe_limit, "summary": summary.model_dump()}
 
 
 @app.get("/api/watchdog/status")
