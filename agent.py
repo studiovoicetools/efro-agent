@@ -352,6 +352,51 @@ class CostLimitRecommendationResult(BaseModel):
     projection: dict[str, Any]
 
 
+class CostPlanTemplate(BaseModel):
+    name: str
+    monthly_price: float = Field(ge=0.0)
+    included_monthly_events: int = Field(ge=0)
+    hard_cap_multiplier: float = Field(default=1.2, ge=1.0, le=10.0)
+
+
+class CostPlanRecommendationInput(BaseModel):
+    limit: int = Field(default=250, ge=1, le=5000)
+    target_gross_margin: float = Field(default=0.7, ge=0.0, le=0.95)
+    safety_multiplier: float = Field(default=1.25, ge=1.0, le=10.0)
+    minimum_cache_hit_rate: float = Field(default=0.7, ge=0.0, le=1.0)
+    plans: list[CostPlanTemplate] = Field(default_factory=lambda: [
+        CostPlanTemplate(name="Starter", monthly_price=29.0, included_monthly_events=3000, hard_cap_multiplier=1.2),
+        CostPlanTemplate(name="Growth", monthly_price=79.0, included_monthly_events=12000, hard_cap_multiplier=1.2),
+        CostPlanTemplate(name="Pro", monthly_price=199.0, included_monthly_events=40000, hard_cap_multiplier=1.15),
+        CostPlanTemplate(name="Enterprise", monthly_price=499.0, included_monthly_events=120000, hard_cap_multiplier=1.1),
+    ])
+
+
+class CostPlanRecommendationItem(BaseModel):
+    name: str
+    monthly_price: float
+    included_monthly_events: int
+    recommended_hard_cap: int
+    safe_monthly_event_limit: int
+    safe_daily_event_limit: int
+    projected_cost_at_included: float
+    projected_margin_at_included: float
+    margin_ok: bool
+    cache_hit_rate_ok: bool
+    upgrade_trigger: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CostPlanRecommendationResult(BaseModel):
+    ok: bool
+    currency: str
+    source_event_count: int
+    cache_hit_rate: float
+    cost_per_event: float
+    plans: list[CostPlanRecommendationItem]
+    warnings: list[str] = Field(default_factory=list)
+
+
 def _ensure_handoff_dir():
     os.makedirs(HANDOFF_DIR, exist_ok=True)
 
@@ -517,6 +562,76 @@ def estimate_cost(event: CostEstimateInput) -> CostEstimateResult:
         },
         cache_status=cache_status,
         write_ledger=event.write_ledger,
+    )
+
+
+def recommend_cost_plans(input_data: CostPlanRecommendationInput) -> CostPlanRecommendationResult:
+    summary = summarize_cost_ledger(limit=input_data.limit)
+    count = max(0, int(summary.count or 0))
+    total_cost = float(summary.estimated_total_cost or 0.0)
+    cost_per_event = (total_cost / count) if count else 0.0
+    adjusted_cost_per_event = cost_per_event * max(1.0, input_data.safety_multiplier)
+    warnings: list[str] = []
+    if count < 25:
+        warnings.append("small_sample_size: collect more ledger events before finalizing plan prices")
+    if summary.cache_hit_rate < input_data.minimum_cache_hit_rate and count > 0:
+        warnings.append("low_cache_hit_rate: improve caching before scaling paid plans")
+    if total_cost == 0 and count > 0:
+        warnings.append("zero_rate_card_or_zero_cost: configure real rates before final plan pricing")
+
+    plan_items: list[CostPlanRecommendationItem] = []
+    for plan in input_data.plans:
+        allowed_cost_budget = plan.monthly_price * max(0.0, 1.0 - input_data.target_gross_margin)
+        if adjusted_cost_per_event > 0:
+            safe_monthly_event_limit = int(allowed_cost_budget / adjusted_cost_per_event)
+        else:
+            safe_monthly_event_limit = 0
+        safe_daily_event_limit = int(safe_monthly_event_limit / 30) if safe_monthly_event_limit else 0
+        projected_cost_at_included = cost_per_event * plan.included_monthly_events
+        projected_margin_at_included = 1.0
+        if plan.monthly_price > 0:
+            projected_margin_at_included = max(-1.0, min(1.0, 1.0 - (projected_cost_at_included / plan.monthly_price)))
+        recommended_hard_cap = int(plan.included_monthly_events * plan.hard_cap_multiplier)
+        margin_ok = projected_margin_at_included >= input_data.target_gross_margin
+        cache_hit_rate_ok = summary.cache_hit_rate >= input_data.minimum_cache_hit_rate
+        item_warnings: list[str] = []
+        if safe_monthly_event_limit and plan.included_monthly_events > safe_monthly_event_limit:
+            item_warnings.append("included_usage_exceeds_safe_limit")
+        if not margin_ok:
+            item_warnings.append("target_margin_not_met")
+        if not cache_hit_rate_ok:
+            item_warnings.append("cache_hit_rate_below_minimum")
+        if count < 25:
+            item_warnings.append("sample_size_too_small")
+        if safe_monthly_event_limit and recommended_hard_cap > safe_monthly_event_limit:
+            recommended_hard_cap = safe_monthly_event_limit
+        upgrade_trigger = (
+            f"Upgrade when monthly events exceed {plan.included_monthly_events} "
+            f"or cache_hit_rate drops below {input_data.minimum_cache_hit_rate:.0%}."
+        )
+        plan_items.append(CostPlanRecommendationItem(
+            name=plan.name,
+            monthly_price=round(plan.monthly_price, 2),
+            included_monthly_events=plan.included_monthly_events,
+            recommended_hard_cap=recommended_hard_cap,
+            safe_monthly_event_limit=safe_monthly_event_limit,
+            safe_daily_event_limit=safe_daily_event_limit,
+            projected_cost_at_included=round(projected_cost_at_included, 8),
+            projected_margin_at_included=round(projected_margin_at_included, 6),
+            margin_ok=margin_ok,
+            cache_hit_rate_ok=cache_hit_rate_ok,
+            upgrade_trigger=upgrade_trigger,
+            warnings=item_warnings,
+        ))
+
+    return CostPlanRecommendationResult(
+        ok=True,
+        currency="USD",
+        source_event_count=count,
+        cache_hit_rate=summary.cache_hit_rate,
+        cost_per_event=round(cost_per_event, 8),
+        plans=plan_items,
+        warnings=warnings,
     )
 
 
@@ -2702,6 +2817,20 @@ async def get_handoffs(limit: int = 25):
         "limit": safe_limit,
         "items": records,
     }
+
+
+@app.post("/api/cost-ledger/recommend-plans")
+async def get_cost_plan_recommendation(input_data: CostPlanRecommendationInput, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost plan recommendation is local-only")
+    return recommend_cost_plans(input_data).model_dump()
+
+
+@app.post("/api/cost-ledger/recommend-plans")
+async def get_cost_plan_recommendation(input_data: CostPlanRecommendationInput, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost plan recommendation is local-only")
+    return recommend_cost_plans(input_data).model_dump()
 
 
 @app.post("/api/cost-ledger/recommend-limits")
