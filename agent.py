@@ -762,6 +762,44 @@ def _extract_brain_reply_fields(parsed: dict[str, Any]) -> tuple[str, dict[str, 
     return reply_text, metadata, debug
 
 
+def _is_transient_urlopen_error(error: Exception) -> bool:
+    value = str(error).lower()
+    return any(
+        needle in value
+        for needle in [
+            "connection reset by peer",
+            "remote end closed connection",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+        ]
+    )
+
+
+def _urlopen_read_with_retry(
+    req: urllib_request.Request,
+    timeout: int,
+    attempts: int = 2,
+    backoff_seconds: float = 0.4,
+) -> tuple[str, int, dict[str, str], int]:
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            with urllib_request.urlopen(req, timeout=timeout) as response:
+                return (
+                    response.read().decode("utf-8", errors="replace"),
+                    getattr(response, "status", 200),
+                    dict(response.headers.items()),
+                    attempt,
+                )
+        except Exception as error:
+            last_error = error
+            if attempt >= attempts or not _is_transient_urlopen_error(error):
+                raise
+            time.sleep(backoff_seconds * attempt)
+    raise last_error or RuntimeError("urlopen retry failed without captured exception")
+
+
 def _check_brain_answer_quality_smoke() -> dict[str, Any]:
     started = time.time()
     configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
@@ -822,9 +860,7 @@ def _check_brain_answer_quality_smoke() -> dict[str, Any]:
                     method="POST",
                     headers={"Content-Type": "application/json", "Accept": "application/json"},
                 )
-                with urllib_request.urlopen(req, timeout=30) as response:
-                    response_body = response.read().decode("utf-8", errors="replace")
-                    status_code = getattr(response, "status", 200)
+                response_body, status_code, _response_headers, retry_attempt = _urlopen_read_with_retry(req, timeout=30)
 
                 latency_ms = int((time.time() - case_started) * 1000)
                 parsed = json.loads(response_body)
@@ -979,10 +1015,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
             method="POST",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
-        with urllib_request.urlopen(answer_req, timeout=35) as response:
-            answer_response_body = response.read().decode("utf-8", errors="replace")
-            answer_status = getattr(response, "status", 200)
-            answer_headers = dict(response.headers.items())
+        answer_response_body, answer_status, answer_headers, answer_retry_attempt = _urlopen_read_with_retry(answer_req, timeout=35)
         answer_latency_ms = int((time.time() - answer_started) * 1000)
         answer_payload = json.loads(answer_response_body)
 
@@ -1011,10 +1044,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
             method="POST",
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
-        with urllib_request.urlopen(tts_req, timeout=45) as response:
-            tts_response_text = response.read().decode("utf-8", errors="replace")
-            tts_status = getattr(response, "status", 200)
-            tts_headers = dict(response.headers.items())
+        tts_response_text, tts_status, tts_headers, tts_retry_attempt = _urlopen_read_with_retry(tts_req, timeout=45)
         tts_latency_ms = int((time.time() - tts_started) * 1000)
         tts_events = _extract_sse_json_events(tts_response_text)
         audio_events = [item for item in tts_events if item.get("type") == "audio" and item.get("data")]
@@ -1045,10 +1075,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
             method="POST",
             headers={"Content-Type": "application/json", "Accept": "application/json", "Cache-Control": "no-cache"},
         )
-        with urllib_request.urlopen(signed_req, timeout=25) as response:
-            signed_response_text = response.read().decode("utf-8", errors="replace")
-            signed_status = getattr(response, "status", 200)
-            signed_headers = dict(response.headers.items())
+        signed_response_text, signed_status, signed_headers, signed_retry_attempt = _urlopen_read_with_retry(signed_req, timeout=25)
         signed_latency_ms = int((time.time() - signed_started) * 1000)
         signed_payload = json.loads(signed_response_text)
         has_signed_url = isinstance(signed_payload.get("signedUrl"), str) and signed_payload.get("signedUrl", "").startswith("wss://")
