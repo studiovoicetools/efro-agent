@@ -1142,29 +1142,41 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
         parity_hash_ok = not parity_hash or parity_hash == reply_hash
         reply_ok = len(reply_text.strip()) >= 40 and not _bad_output_leaks(reply_text)
 
+        paid_tts_watchdog_enabled = os.getenv("EFRO_ENABLE_PAID_TTS_WATCHDOG", "").strip().lower() in {"1", "true", "yes", "on"}
         current_stage = "tts"
-        tts_started = time.time()
-        tts_probe_text = os.getenv("EFRO_WIDGET_TTS_WATCHDOG_TEXT", "Hallo EFRO.").strip() or "Hallo EFRO."
-        tts_body = json.dumps({"text": tts_probe_text, "language": "de", "shopDomain": shop_domain}).encode("utf-8")
-        tts_req = urllib_request.Request(
-            tts_url,
-            data=tts_body,
-            method="POST",
-            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
-        )
-        tts_response_text, tts_status, tts_headers, tts_retry_attempt = _urlopen_read_with_retry(tts_req, timeout=45)
-        tts_latency_ms = int((time.time() - tts_started) * 1000)
-        tts_events = _extract_sse_json_events(tts_response_text)
-        audio_events = [item for item in tts_events if item.get("type") == "audio" and item.get("data")]
-        viseme_events = [item for item in tts_events if item.get("type") == "visemes"]
-        done_events = [item for item in tts_events if item.get("type") == "done"]
+        tts_status = 0
+        tts_latency_ms = 0
+        tts_headers: dict[str, str] = {}
+        tts_retry_attempt = 0
+        audio_events: list[dict[str, Any]] = []
+        viseme_events: list[dict[str, Any]] = []
+        done_events: list[dict[str, Any]] = []
         viseme_count = 0
-        for item in viseme_events:
-            visemes = item.get("visemes")
-            if isinstance(visemes, list):
-                viseme_count += len(visemes)
-        audio_ok = tts_status == 200 and bool(audio_events)
-        tts_event_contract_ok = bool(audio_events) and bool(viseme_events) and bool(done_events)
+        audio_ok = True
+        tts_event_contract_ok = True
+
+        if paid_tts_watchdog_enabled:
+            tts_started = time.time()
+            tts_probe_text = os.getenv("EFRO_WIDGET_TTS_WATCHDOG_TEXT", "Hallo EFRO.").strip() or "Hallo EFRO."
+            tts_body = json.dumps({"text": tts_probe_text, "language": "de", "shopDomain": shop_domain}).encode("utf-8")
+            tts_req = urllib_request.Request(
+                tts_url,
+                data=tts_body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+            )
+            tts_response_text, tts_status, tts_headers, tts_retry_attempt = _urlopen_read_with_retry(tts_req, timeout=45)
+            tts_latency_ms = int((time.time() - tts_started) * 1000)
+            tts_events = _extract_sse_json_events(tts_response_text)
+            audio_events = [item for item in tts_events if item.get("type") == "audio" and item.get("data")]
+            viseme_events = [item for item in tts_events if item.get("type") == "visemes"]
+            done_events = [item for item in tts_events if item.get("type") == "done"]
+            for item in viseme_events:
+                visemes = item.get("visemes")
+                if isinstance(visemes, list):
+                    viseme_count += len(visemes)
+            audio_ok = tts_status == 200 and bool(audio_events)
+            tts_event_contract_ok = bool(audio_events) and bool(viseme_events) and bool(done_events)
 
         current_stage = "signed_url"
         signed_started = time.time()
@@ -1192,17 +1204,21 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
         answer_cache_control = str(answer_headers.get("cache-control") or answer_headers.get("Cache-Control") or "")
         tts_cache_control = str(tts_headers.get("cache-control") or tts_headers.get("Cache-Control") or "")
         signed_cache_control = str(signed_headers.get("cache-control") or signed_headers.get("Cache-Control") or "")
-        cache_contract_ok = (
+        answer_cache_contract_ok = (
             "no-store" in answer_cache_control.lower()
             or "no-cache" in answer_cache_control.lower()
             or source in {"efro_brain", "direct", "efro_import_smoke"}
-        ) and ("no-cache" in tts_cache_control.lower() or "no-store" in tts_cache_control.lower())
+        )
+        tts_cache_contract_ok = (not paid_tts_watchdog_enabled) or (
+            "no-cache" in tts_cache_control.lower() or "no-store" in tts_cache_control.lower()
+        )
+        cache_contract_ok = answer_cache_contract_ok and tts_cache_contract_ok
 
         voice_chat_parity_ok = field_agreement and parity_hash_ok and reply_ok
-        voice_runtime_ok = audio_ok and tts_event_contract_ok and has_signed_url
-        lipsync_signal_ok = bool(viseme_events)
-        # Empty viseme arrays are currently tolerated because Mascot natural lipsync runs client-side,
-        # but the event itself must exist so the pipeline can be observed.
+        voice_runtime_ok = has_signed_url and (not paid_tts_watchdog_enabled or (audio_ok and tts_event_contract_ok))
+        lipsync_signal_ok = (not paid_tts_watchdog_enabled) or bool(viseme_events)
+        # Paid TTS is disabled by default because it consumes ElevenLabs credits.
+        # Browser voice is covered by signedUrl plus explicit manual/preview smoke when needed.
         ok = voice_chat_parity_ok and voice_runtime_ok and lipsync_signal_ok and cache_contract_ok
 
         evidence = _clip_text(json.dumps({
@@ -1217,6 +1233,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
                 "cache_control": answer_cache_control,
             },
             "tts": {
+                "paid_watchdog_enabled": paid_tts_watchdog_enabled,
                 "http": tts_status,
                 "latency_ms": tts_latency_ms,
                 "audio_events": len(audio_events),
@@ -1245,10 +1262,11 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
             status="ok" if ok else "error",
             kind="runtime_parity",
             evidence=evidence,
-            expected="Widget answer fields agree by hash, spoken/voice text equals chat text, TTS returns audio+viseme+done events, signedUrl starts wss://, cache headers avoid stale runtime responses",
+            expected="Widget answer fields agree by hash, spoken/voice text equals chat text, signedUrl starts wss://, cache headers avoid stale runtime responses; paid TTS probe only runs when EFRO_ENABLE_PAID_TTS_WATCHDOG=true",
             observed=(
                 f"field_agreement={field_agreement}; parity_hash_ok={parity_hash_ok}; "
-                f"audio_ok={audio_ok}; viseme_events={len(viseme_events)}; signedUrl={has_signed_url}; "
+                f"paid_tts_watchdog_enabled={paid_tts_watchdog_enabled}; audio_ok={audio_ok}; "
+                f"viseme_events={len(viseme_events)}; signedUrl={has_signed_url}; "
                 f"cache_contract_ok={cache_contract_ok}; source={source}"
             ),
             duration_ms=int((time.time() - started) * 1000),
