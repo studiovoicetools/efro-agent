@@ -393,6 +393,8 @@ class CostPlanRecommendationResult(BaseModel):
     source_event_count: int
     cache_hit_rate: float
     cost_per_event: float
+    plan_source: str = "example_defaults_or_request_payload"
+    pricing_note: str = "Plan prices are calculator inputs, not final EFRO prices. Override plans in the request payload before making pricing decisions."
     plans: list[CostPlanRecommendationItem]
     warnings: list[str] = Field(default_factory=list)
 
@@ -2819,11 +2821,17 @@ async def get_handoffs(limit: int = 25):
     }
 
 
-@app.post("/api/cost-ledger/recommend-plans")
-async def get_cost_plan_recommendation(input_data: CostPlanRecommendationInput, request: Request):
+@app.get("/api/cost-ledger/plan-templates")
+async def get_cost_plan_templates(request: Request):
     if not _is_local_request(request):
-        raise HTTPException(status_code=403, detail="cost plan recommendation is local-only")
-    return recommend_cost_plans(input_data).model_dump()
+        raise HTTPException(status_code=403, detail="cost plan templates are local-only")
+    defaults = CostPlanRecommendationInput()
+    return {
+        "ok": True,
+        "plan_source": "example_defaults",
+        "pricing_note": "These are calculator templates, not final EFRO prices. Override the plans array in /api/cost-ledger/recommend-plans before pricing decisions.",
+        "plans": [item.model_dump() for item in defaults.plans],
+    }
 
 
 @app.post("/api/cost-ledger/recommend-plans")
