@@ -249,6 +249,40 @@ class CostLedgerSummary(BaseModel):
     latest: list[dict[str, Any]]
 
 
+class CostEstimateInput(BaseModel):
+    shop_domain: str = Field(default="unknown", max_length=255)
+    subsystem: str = Field(default="manual_cost_audit", max_length=120)
+    endpoint: str = Field(default="unknown", max_length=255)
+    provider: str = Field(default="unknown", max_length=120)
+    operation: str = Field(default="estimate_only", max_length=160)
+    request_id: str = Field(default_factory=lambda: f"estimate_{uuid4().hex[:12]}", max_length=120)
+    session_id: str | None = Field(default=None, max_length=160)
+    cache_key: str | None = Field(default=None, max_length=255)
+    cache_status: str = Field(default="unknown", max_length=40)
+    tokens_in: int | None = Field(default=None, ge=0)
+    tokens_out: int | None = Field(default=None, ge=0)
+    characters: int | None = Field(default=None, ge=0)
+    requests: int = Field(default=1, ge=1)
+    sessions: int = Field(default=0, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+    observed_status: str = Field(default="estimated_without_provider_call", max_length=80)
+    notes: str | None = Field(default=None, max_length=1000)
+    write_ledger: bool = False
+
+
+class CostEstimateResult(BaseModel):
+    ok: bool
+    provider: str
+    endpoint: str
+    estimated_cost: float
+    currency: str
+    formula: str
+    billable_units: dict[str, Any]
+    cache_status: str
+    write_ledger: bool
+    ledger_record: dict[str, Any] | None = None
+
+
 def _ensure_handoff_dir():
     os.makedirs(HANDOFF_DIR, exist_ok=True)
 
@@ -309,6 +343,90 @@ def _add_cost_bucket(target: dict[str, dict[str, Any]], key: str, record: dict[s
     bucket["tokens_in"] += int(record.get("tokens_in") or 0)
     bucket["tokens_out"] += int(record.get("tokens_out") or 0)
     bucket["characters"] += int(record.get("characters") or 0)
+
+
+def _cost_rate_card() -> dict[str, dict[str, Any]]:
+    return {
+        "brain_llm": {
+            "currency": "USD",
+            "input_per_1k_tokens": float(os.getenv("EFRO_RATE_BRAIN_INPUT_PER_1K", "0.0")),
+            "output_per_1k_tokens": float(os.getenv("EFRO_RATE_BRAIN_OUTPUT_PER_1K", "0.0")),
+            "request_fixed": float(os.getenv("EFRO_RATE_BRAIN_REQUEST_FIXED", "0.0")),
+        },
+        "widget_answer": {
+            "currency": "USD",
+            "request_fixed": float(os.getenv("EFRO_RATE_WIDGET_ANSWER_REQUEST_FIXED", "0.0")),
+        },
+        "mascot_voice": {
+            "currency": "USD",
+            "session_fixed": float(os.getenv("EFRO_RATE_MASCOT_SESSION_FIXED", "0.0")),
+            "request_fixed": float(os.getenv("EFRO_RATE_MASCOT_REQUEST_FIXED", "0.0")),
+        },
+        "elevenlabs_tts": {
+            "currency": "USD",
+            "per_1k_characters": float(os.getenv("EFRO_RATE_ELEVENLABS_PER_1K_CHARS", "0.0")),
+            "request_fixed": float(os.getenv("EFRO_RATE_ELEVENLABS_REQUEST_FIXED", "0.0")),
+        },
+    }
+
+
+def estimate_cost(event: CostEstimateInput) -> CostEstimateResult:
+    cache_status = (event.cache_status or "unknown").lower()
+    if cache_status == "hit":
+        return CostEstimateResult(
+            ok=True,
+            provider=event.provider,
+            endpoint=event.endpoint,
+            estimated_cost=0.0,
+            currency="USD",
+            formula="cache_hit => 0 estimated provider cost",
+            billable_units={"cache_status": cache_status},
+            cache_status=cache_status,
+            write_ledger=event.write_ledger,
+        )
+
+    rates = _cost_rate_card()
+    provider = event.provider or "unknown"
+    rate = rates.get(provider, {"currency": "USD", "request_fixed": 0.0})
+    requests = max(1, int(event.requests or 1))
+    sessions = max(0, int(event.sessions or 0))
+    tokens_in = int(event.tokens_in or 0)
+    tokens_out = int(event.tokens_out or 0)
+    characters = int(event.characters or 0)
+
+    estimated = requests * float(rate.get("request_fixed", 0.0))
+    formula_parts = [f"requests({requests})*request_fixed({rate.get('request_fixed', 0.0)})"]
+
+    if provider == "brain_llm":
+        estimated += (tokens_in / 1000.0) * float(rate.get("input_per_1k_tokens", 0.0))
+        estimated += (tokens_out / 1000.0) * float(rate.get("output_per_1k_tokens", 0.0))
+        formula_parts.append(f"tokens_in({tokens_in})/1000*{rate.get('input_per_1k_tokens', 0.0)}")
+        formula_parts.append(f"tokens_out({tokens_out})/1000*{rate.get('output_per_1k_tokens', 0.0)}")
+    elif provider == "elevenlabs_tts":
+        estimated += (characters / 1000.0) * float(rate.get("per_1k_characters", 0.0))
+        formula_parts.append(f"characters({characters})/1000*{rate.get('per_1k_characters', 0.0)}")
+    elif provider == "mascot_voice":
+        estimated += sessions * float(rate.get("session_fixed", 0.0))
+        formula_parts.append(f"sessions({sessions})*session_fixed({rate.get('session_fixed', 0.0)})")
+
+    return CostEstimateResult(
+        ok=True,
+        provider=provider,
+        endpoint=event.endpoint,
+        estimated_cost=round(estimated, 8),
+        currency=str(rate.get("currency", "USD")),
+        formula=" + ".join(formula_parts),
+        billable_units={
+            "requests": requests,
+            "sessions": sessions,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "characters": characters,
+            "cache_status": cache_status,
+        },
+        cache_status=cache_status,
+        write_ledger=event.write_ledger,
+    )
 
 
 def summarize_cost_ledger(limit: int = 250) -> CostLedgerSummary:
@@ -2368,6 +2486,46 @@ async def get_handoffs(limit: int = 25):
         "limit": safe_limit,
         "items": records,
     }
+
+
+@app.get("/api/cost-ledger/rate-card")
+async def get_cost_ledger_rate_card(request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost rate card is local-only")
+    return {"ok": True, "currency": "USD", "rate_card": _cost_rate_card()}
+
+
+@app.post("/api/cost-ledger/estimate")
+async def estimate_cost_ledger_event(event: CostEstimateInput, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost estimates are local-only")
+    estimate = estimate_cost(event)
+    ledger_record: CostLedgerRecord | None = None
+    if event.write_ledger:
+        ledger_event = CostLedgerEvent(
+            shop_domain=event.shop_domain,
+            subsystem=event.subsystem,
+            endpoint=event.endpoint,
+            provider=event.provider,
+            operation=event.operation,
+            request_id=event.request_id,
+            session_id=event.session_id,
+            cache_key=event.cache_key,
+            cache_status=event.cache_status,
+            input_size=None,
+            output_size=None,
+            tokens_in=event.tokens_in,
+            tokens_out=event.tokens_out,
+            characters=event.characters,
+            estimated_cost=estimate.estimated_cost,
+            currency=estimate.currency,
+            observed_status=event.observed_status,
+            latency_ms=event.latency_ms,
+            notes=event.notes,
+        )
+        ledger_record = append_cost_ledger_event(ledger_event)
+        estimate.ledger_record = ledger_record.model_dump()
+    return estimate.model_dump()
 
 
 @app.post("/api/cost-ledger/events")
