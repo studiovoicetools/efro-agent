@@ -296,6 +296,27 @@ def _watchdog_public_failure_threshold() -> int:
     except Exception:
         return 3
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _costly_watchdog_checks_enabled() -> bool:
+    return _env_flag("EFRO_ENABLE_COSTLY_WATCHDOG_CHECKS", "0")
+
+
+def _zero_cost_skip_check(check_name: str, target: str, kind: str, reason: str) -> dict[str, Any]:
+    return _run_observation_check(
+        check_name=check_name,
+        target=target,
+        status="ok",
+        kind=kind,
+        evidence=f"skipped_by_default=true; zero_cost_watchdog=true; reason={reason}; enable_with=EFRO_ENABLE_COSTLY_WATCHDOG_CHECKS=true",
+        expected="Zero-cost watchdog default must not invoke provider, LLM, voice, TTS, or other metered external runtime calls",
+        observed="skipped_by_default=true; no provider call executed",
+        duration_ms=0,
+    )
+
 def _telegram_enabled() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
@@ -545,6 +566,13 @@ def _check_public_health_contract() -> dict[str, Any]:
 def _check_widget_voice_signed_url_prod() -> dict[str, Any]:
     started = time.time()
     target = os.getenv("EFRO_WIDGET_SIGNED_URL_PROD", "https://widget.avatarsalespro.com/api/get-signed-url").strip()
+    if not _costly_watchdog_checks_enabled():
+        return _zero_cost_skip_check(
+            "widget_voice_signed_url_prod",
+            target,
+            "technical",
+            "signed-url probe may invoke Mascot/voice provider or metered runtime",
+        )
     payload = {
         "dynamicVariables": {
             "name": "EFRO",
@@ -609,6 +637,13 @@ def _bad_output_leaks(text: str) -> list[str]:
 
 def _check_brain_live_prod() -> dict[str, Any]:
     started = time.time()
+    if not _costly_watchdog_checks_enabled():
+        return _zero_cost_skip_check(
+            "brain_live_prod",
+            "configured brain endpoint",
+            "technical",
+            "brain live probe may invoke LLM/vector/database metered runtime",
+        )
     configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
     configured_base = os.getenv("EFRO_BRAIN_URL", os.getenv("BRAIN_API_URL", "")).strip().rstrip("/")
     candidate_targets: list[str] = []
@@ -802,6 +837,13 @@ def _urlopen_read_with_retry(
 
 def _check_shopify_product_inventory() -> dict[str, Any]:
     started = time.time()
+    if not _costly_watchdog_checks_enabled():
+        return _zero_cost_skip_check(
+            "shopify_product_inventory",
+            "configured brain endpoint",
+            "inventory",
+            "inventory probe may invoke Brain/LLM/provider runtime",
+        )
     configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
     configured_base = os.getenv("EFRO_BRAIN_URL", os.getenv("BRAIN_API_URL", "")).strip().rstrip("/")
     candidate_targets: list[str] = []
@@ -906,6 +948,13 @@ def _check_shopify_product_inventory() -> dict[str, Any]:
 
 def _check_brain_answer_quality_smoke() -> dict[str, Any]:
     started = time.time()
+    if not _costly_watchdog_checks_enabled():
+        return _zero_cost_skip_check(
+            "brain_answer_quality_smoke",
+            "configured brain endpoint",
+            "answer_quality",
+            "answer-quality smoke may invoke LLM/provider runtime multiple times",
+        )
     configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
     configured_base = os.getenv("EFRO_BRAIN_URL", os.getenv("BRAIN_API_URL", "")).strip().rstrip("/")
     candidate_targets: list[str] = []
@@ -1097,6 +1146,13 @@ def _extract_sse_json_events(response_text: str) -> list[dict[str, Any]]:
 def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
     started = time.time()
     widget_base = os.getenv("EFRO_WIDGET_BASE_URL", "https://widget.avatarsalespro.com").strip().rstrip("/")
+    if not _costly_watchdog_checks_enabled():
+        return _zero_cost_skip_check(
+            "widget_chat_voice_cache_parity",
+            widget_base,
+            "runtime_parity",
+            "widget parity probe may invoke Brain/LLM, Mascot signed-url, and paid voice/TTS runtime",
+        )
     shop_domain = os.getenv("EFRO_BRAIN_LIVE_PROD_SHOP_DOMAIN", "avatarsalespro-dev.myshopify.com").strip()
     message = os.getenv("EFRO_WIDGET_PARITY_MESSAGE", "Ich suche ein passendes Produkt. Was empfiehlst du mir?").strip()
     session_id = f"watchdog-widget-parity-{int(time.time())}"
@@ -1737,7 +1793,7 @@ def run_watchdog_cycle(shop_key: str = "efro") -> dict[str, Any]:
         "degraded": len(observed_failed_checks) > 0,
         "summary_status": summary_status,
         "mode": "read-only watchdog",
-        "answer_quality_scope": "internal contract checks plus external public health probe via curl subprocess; no full semantic correctness scoring yet",
+        "answer_quality_scope": "zero-cost default watchdog: local/public-health/log/contract checks only; provider/LLM/voice/runtime probes require EFRO_ENABLE_COSTLY_WATCHDOG_CHECKS=true",
         "observed_failed_count": len(observed_failed_checks),
         "failed_count": len(incident_failed_checks),
         "public_health_consecutive_failures": public_health_consecutive_failures,
