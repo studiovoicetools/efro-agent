@@ -2,6 +2,7 @@ venv/
 repos/
 chroma_db/
 handoffs/
+cost-ledger/
 .env
 agent.log
 __pycache__/
