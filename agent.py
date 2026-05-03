@@ -800,6 +800,106 @@ def _urlopen_read_with_retry(
     raise last_error or RuntimeError("urlopen retry failed without captured exception")
 
 
+def _check_shopify_product_inventory() -> dict[str, Any]:
+    started = time.time()
+    configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
+    configured_base = os.getenv("EFRO_BRAIN_URL", os.getenv("BRAIN_API_URL", "")).strip().rstrip("/")
+    candidate_targets: list[str] = []
+    if configured_target:
+        candidate_targets.append(configured_target)
+    if configured_base:
+        candidate_targets.append(f"{configured_base}/api/brain/chat")
+    candidate_targets.extend([
+        "https://efro-brain.vercel.app/api/brain/chat",
+        "https://brain.avatarsalespro.com/api/brain/chat",
+    ])
+    candidate_targets = list(dict.fromkeys([item for item in candidate_targets if item]))
+
+    shop_domain = os.getenv("EFRO_BRAIN_LIVE_PROD_SHOP_DOMAIN", "avatarsalespro-dev.myshopify.com").strip()
+    expected_product_count_raw = os.getenv("EFRO_BRAIN_EXPECTED_PRODUCT_COUNT", "134").strip()
+    try:
+        expected_product_count = max(1, int(expected_product_count_raw))
+    except Exception:
+        expected_product_count = 134
+
+    observations: list[str] = []
+    for target in candidate_targets:
+        try:
+            payload = {
+                "message": "Zeige mir verfuegbare Shopify Produkte und nenne konkrete Produktempfehlungen mit Preis.",
+                "shopDomain": shop_domain,
+                "sessionId": f"watchdog-shopify-inventory-{int(time.time())}",
+                "channel": "watchdog",
+                "siteType": "shopify",
+            }
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib_request.Request(
+                target,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            response_body, status_code, _headers, retry_attempt = _urlopen_read_with_retry(req, timeout=35)
+            parsed = json.loads(response_body)
+            reply_text, metadata, debug = _extract_brain_reply_fields(parsed)
+            api_diagnostics = debug.get("apiDiagnostics") if isinstance(debug.get("apiDiagnostics"), dict) else {}
+            candidates = parsed.get("candidates") if isinstance(parsed.get("candidates"), list) else []
+
+            success = parsed.get("success") is True
+            blocked = parsed.get("blocked") is True
+            total_products = metadata.get("totalProducts")
+            db_product_count = api_diagnostics.get("dbProductCount")
+            total_products_ok = isinstance(total_products, int) and total_products >= expected_product_count
+            db_product_count_ok = db_product_count is None or (isinstance(db_product_count, int) and db_product_count >= expected_product_count)
+            reply_lower = reply_text.lower()
+            concrete_product_ok = bool(candidates) or any(term in reply_lower for term in ["smart tv", "fernseher", "wasserkocher", "soundbar", "parfum"])
+            price_ok = "€" in reply_text or "eur" in reply_lower or "preis" in reply_lower
+            leaks = _bad_output_leaks(reply_text)
+
+            ok = (
+                status_code == 200
+                and success
+                and not blocked
+                and total_products_ok
+                and db_product_count_ok
+                and concrete_product_ok
+                and price_ok
+                and not leaks
+            )
+            observations.append(
+                f"{target}: http={status_code}; success={success}; totalProducts={total_products}; "
+                f"dbProductCount={db_product_count}; candidates={len(candidates)}; concrete_product_ok={concrete_product_ok}; "
+                f"price_ok={price_ok}; blocked={blocked}; retry_attempt={retry_attempt}; leaks={leaks}"
+            )
+            if ok:
+                evidence = _clip_text(observations[-1], 360)
+                return _run_observation_check(
+                    check_name="shopify_product_inventory",
+                    target=target,
+                    status="ok",
+                    kind="inventory",
+                    evidence=evidence,
+                    expected=f"Brain sees Shopify inventory with totalProducts>={expected_product_count}, concrete products and price signal",
+                    observed=evidence,
+                    duration_ms=int((time.time() - started) * 1000),
+                )
+        except Exception as e:
+            observations.append(f"{target}: exception={e}")
+
+    evidence = _clip_text(" || ".join(observations), 700)
+    return _run_observation_check(
+        check_name="shopify_product_inventory",
+        target=", ".join(candidate_targets[:3]),
+        status="error",
+        kind="inventory",
+        evidence=evidence,
+        expected=f"At least one Brain endpoint proves Shopify inventory with totalProducts>={expected_product_count}, product and price signal",
+        observed=evidence,
+        duration_ms=int((time.time() - started) * 1000),
+    )
+
+
+
 def _check_brain_answer_quality_smoke() -> dict[str, Any]:
     started = time.time()
     configured_target = os.getenv("EFRO_BRAIN_LIVE_PROD_URL", "").strip()
@@ -1432,6 +1532,7 @@ def _efro_watchdog_checks() -> list[dict[str, Any]]:
         _check_public_health_contract(),
         _check_widget_voice_signed_url_prod(),
         _check_brain_live_prod(),
+        _check_shopify_product_inventory(),
         _check_brain_answer_quality_smoke(),
         _check_widget_chat_voice_cache_parity(),
         _check_mcp_stream_disconnects(),
