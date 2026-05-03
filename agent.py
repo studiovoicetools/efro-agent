@@ -1144,7 +1144,8 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
 
         current_stage = "tts"
         tts_started = time.time()
-        tts_body = json.dumps({"text": spoken_text or reply_text, "language": "de", "shopDomain": shop_domain}).encode("utf-8")
+        tts_probe_text = os.getenv("EFRO_WIDGET_TTS_WATCHDOG_TEXT", "Hallo EFRO.").strip() or "Hallo EFRO."
+        tts_body = json.dumps({"text": tts_probe_text, "language": "de", "shopDomain": shop_domain}).encode("utf-8")
         tts_req = urllib_request.Request(
             tts_url,
             data=tts_body,
@@ -1253,9 +1254,17 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
             duration_ms=int((time.time() - started) * 1000),
         )
     except Exception as e:
+        http_status = getattr(e, "code", None)
+        error_body = ""
+        try:
+            if hasattr(e, "read"):
+                error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = ""
         evidence = _clip_text(
-            f"stage={current_stage}; exception={e}; answer_url={answer_url}; tts_url={tts_url}; signed_url={signed_url}",
-            700,
+            f"stage={current_stage}; exception={e}; http_status={http_status}; "
+            f"error_body={error_body[:500]}; answer_url={answer_url}; tts_url={tts_url}; signed_url={signed_url}",
+            900,
         )
         return _run_observation_check(
             check_name="widget_chat_voice_cache_parity",
