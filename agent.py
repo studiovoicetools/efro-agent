@@ -3480,6 +3480,139 @@ async def health():
         "repos": sorted(REPO_PATHS.keys()),
     }
 
+@app.get("/admin/costs")
+async def admin_costs():
+    html = '''<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EFRO Kosten & Pakete</title>
+    <style>
+        :root { color-scheme: dark; --bg:#0b1020; --panel:#121934; --border:#283355; --text:#e8ecf8; --muted:#9ca9cf; --good:#b8ffd6; --warn:#ffe7c2; --bad:#ffb7b7; --accent:#87b3ff; }
+        * { box-sizing: border-box; }
+        body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:linear-gradient(180deg,#0b1020,#0d1327); color:var(--text); }
+        .wrap { max-width: 1280px; margin: 0 auto; padding: 24px; }
+        .topbar { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:18px; }
+        h1 { margin:0 0 6px; font-size:24px; }
+        p { color:var(--muted); line-height:1.45; }
+        a, button { color:var(--text); }
+        .btn { border:1px solid var(--border); background:#172040; border-radius:12px; padding:10px 13px; text-decoration:none; cursor:pointer; }
+        .grid { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:14px; }
+        .card { border:1px solid var(--border); background:rgba(18,25,52,.86); border-radius:18px; padding:16px; box-shadow:0 18px 50px rgba(0,0,0,.22); }
+        .full { grid-column:1 / -1; }
+        .metric { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:10px; }
+        .metric > div { border:1px solid var(--border); border-radius:14px; padding:12px; background:#172040; }
+        .label { color:var(--muted); font-size:12px; }
+        .value { margin-top:5px; font-size:20px; font-weight:800; color:var(--good); }
+        table { width:100%; border-collapse:collapse; font-size:13px; }
+        th, td { border-bottom:1px solid var(--border); padding:9px 7px; text-align:left; vertical-align:top; }
+        th { color:var(--muted); font-weight:700; }
+        .warn { color:var(--warn); }
+        .bad { color:var(--bad); }
+        .good { color:var(--good); }
+        pre { white-space:pre-wrap; background:#080c18; border:1px solid var(--border); border-radius:14px; padding:12px; color:#cbd5f4; overflow:auto; max-height:320px; }
+        .actions { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0; }
+        input { background:#0b1020; border:1px solid var(--border); color:var(--text); border-radius:10px; padding:9px; width:130px; }
+        @media (max-width: 900px) { .grid, .metric { grid-template-columns:1fr; } .topbar { flex-direction:column; } }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="topbar">
+        <div>
+            <h1>EFRO Kosten & Pakete</h1>
+            <p>Separate Übersicht für Watchdog-Kostenstatus, Ledger, Live-AI-Minuten, Margen, Break-even und Overage. Watchdog bleibt zero-cost; echte Providerkosten werden nur über kontrollierte Messläufe erfasst.</p>
+        </div>
+        <a class="btn" href="/admin/import">← Zur Hauptseite</a>
+    </div>
+
+    <div class="actions">
+        <button class="btn" id="refresh">Aktualisieren</button>
+        <button class="btn" id="copy">Übersicht kopieren</button>
+        <label class="label">Kosten/Live-Minute € <input id="costMinute" type="number" step="0.01" value="0.25"></label>
+        <label class="label">Safety <input id="safety" type="number" step="0.1" value="1.5"></label>
+        <label class="label">Zielmarge <input id="margin" type="number" step="0.05" value="0.7"></label>
+    </div>
+
+    <div class="grid">
+        <section class="card full">
+            <h2>Status</h2>
+            <div class="metric" id="statusMetrics"><div><div class="label">Lade…</div><div class="value">–</div></div></div>
+        </section>
+        <section class="card full">
+            <h2>Commercial Pricing nach Live-AI-Minuten</h2>
+            <p class="warn">Wichtig: Kosten pro Live-AI-Minute sind bis zu echten Messläufen nur konservative Annahmen. Preise sind steuerbar, nicht final durch Testdaten bewiesen.</p>
+            <table>
+                <thead><tr><th>Paket</th><th>Preis</th><th>Setup</th><th>Minuten inkl.</th><th>Overage</th><th>Providerkosten</th><th>Marge</th><th>Break-even Min.</th><th>Warnungen</th></tr></thead>
+                <tbody id="commercialRows"></tbody>
+            </table>
+        </section>
+        <section class="card">
+            <h2>Ledger Summary</h2>
+            <pre id="ledgerRaw">Lade…</pre>
+        </section>
+        <section class="card">
+            <h2>Commercial Raw</h2>
+            <pre id="commercialRaw">Lade…</pre>
+        </section>
+    </div>
+</div>
+<script>
+const statusMetrics = document.getElementById('statusMetrics');
+const commercialRows = document.getElementById('commercialRows');
+const ledgerRaw = document.getElementById('ledgerRaw');
+const commercialRaw = document.getElementById('commercialRaw');
+const costMinute = document.getElementById('costMinute');
+const safety = document.getElementById('safety');
+const margin = document.getElementById('margin');
+let latestSnapshot = '';
+function money(v, currency='€') { return `${Number(v || 0).toLocaleString('de-DE', {minimumFractionDigits:2, maximumFractionDigits:2})} ${currency}`; }
+function pct(v) { return `${(Number(v || 0) * 100).toFixed(2)}%`; }
+function renderMetrics(watchdog, ledger) {
+ const s = ledger.summary || {};
+ statusMetrics.innerHTML = `
+  <div><div class="label">Watchdog Billing</div><div class="value">${watchdog.billing_mode || 'n/a'}</div></div>
+  <div><div class="label">Metered Checks</div><div class="value">${watchdog.metered_checks_enabled ? 'AN' : 'AUS'}</div></div>
+  <div><div class="label">Ledger Kosten</div><div class="value">${s.estimated_total_cost || 0} ${s.currency || 'USD'}</div></div>
+  <div><div class="label">Cache Hit Rate</div><div class="value">${pct(s.cache_hit_rate || 0)}</div></div>`;
+}
+function renderCommercial(data) {
+ commercialRows.innerHTML = '';
+ for (const p of data.plans || []) {
+  const warnings = (p.warnings || []).join(', ') || '–';
+  const marginClass = p.margin_ok ? 'good' : 'bad';
+  const row = document.createElement('tr');
+  row.innerHTML = `<td><strong>${p.name}</strong></td><td>${money(p.monthly_price_eur)}</td><td>${money(p.setup_fee_eur)}</td><td>${p.included_live_ai_minutes}</td><td>${p.overage_per_minute_eur === null ? 'custom' : money(p.overage_per_minute_eur)}</td><td>${money(p.projected_provider_cost_eur)}</td><td class="${marginClass}">${pct(p.projected_gross_margin)}</td><td>${p.break_even_minutes}</td><td class="warn">${warnings}</td>`;
+  commercialRows.appendChild(row);
+ }
+}
+async function loadAll() {
+ const commercialPayload = { projected_cost_per_live_ai_minute_eur: Number(costMinute.value || 0), safety_multiplier: Number(safety.value || 1), target_gross_margin: Number(margin.value || 0.7) };
+ const [watchdogResp, ledgerResp, commercialResp] = await Promise.all([
+  fetch('/api/watchdog/summary?shop=efro'),
+  fetch('/api/cost-ledger/summary'),
+  fetch('/api/cost-ledger/commercial-pricing', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(commercialPayload) })
+ ]);
+ const watchdog = await watchdogResp.json();
+ const ledger = await ledgerResp.json();
+ const commercial = await commercialResp.json();
+ renderMetrics(watchdog, ledger);
+ renderCommercial(commercial);
+ ledgerRaw.textContent = JSON.stringify(ledger.summary || ledger, null, 2);
+ commercialRaw.textContent = JSON.stringify(commercial, null, 2);
+ latestSnapshot = `Watchdog: ${watchdog.billing_mode}\nMetered: ${watchdog.metered_checks_enabled}\nLedger Kosten: ${(ledger.summary||{}).estimated_total_cost} ${(ledger.summary||{}).currency}\nCommercial Pricing:\n${(commercial.plans||[]).map(p => `${p.name}: ${p.monthly_price_eur}€/Monat, ${p.included_live_ai_minutes} Min, Marge ${pct(p.projected_gross_margin)}, Warnungen ${(p.warnings||[]).join('|') || '-'}`).join('\n')}`;
+}
+document.getElementById('refresh').onclick = loadAll;
+document.getElementById('copy').onclick = async () => navigator.clipboard.writeText(latestSnapshot || 'Noch keine Daten geladen.');
+[costMinute, safety, margin].forEach(el => el.addEventListener('change', loadAll));
+loadAll().catch(err => { commercialRaw.textContent = err.message; });
+</script>
+</body>
+</html>'''
+    return HTMLResponse(content=html)
+
+
 @app.get("/")
 @app.get("/admin/import")
 @app.get("/handoff/{handoff_id}")
@@ -3928,21 +4061,11 @@ async def root(handoff_id: Optional[str] = None):
             <div class="pricing-panel">
                 <div>
                     <h3 class="handoff-panel-title">Kosten & Pakete</h3>
-                    <div class="pricing-warning">Watchdog muss zero-cost bleiben. Live-AI-Minuten und Providerkosten werden getrennt gemessen; die Paketpreise unten sind deine Landingpage-Kalkulation, nicht automatisch aus Testdaten finalisiert.</div>
+                    <div class="pricing-warning">Die ausführliche Kosten-, Margen- und Paketübersicht liegt auf einer eigenen Seite, damit die Hauptansicht übersichtlich bleibt.</div>
                 </div>
-                <div id="billing-status" class="pricing-grid">
-                    <div class="pricing-card"><strong>Watchdog</strong><small>Lade Kostenstatus…</small></div>
-                    <div class="pricing-card"><strong>Ledger</strong><small>Lade erfasste Kosten…</small></div>
-                </div>
-                <table class="pricing-table" aria-label="EFRO Pakete">
-                    <thead><tr><th>Paket</th><th>Preis</th><th>Setup</th><th>Live-AI-Minuten</th><th>Overage</th></tr></thead>
-                    <tbody id="pricing-table-body"></tbody>
-                </table>
                 <div class="pricing-actions">
-                    <button id="refresh-pricing" class="ghost">Kosten aktualisieren</button>
-                    <button id="copy-pricing" class="ghost">Kostenübersicht kopieren</button>
+                    <a class="ghost" href="/admin/costs" style="text-decoration:none; display:inline-flex; align-items:center;">Kosten & Pakete öffnen</a>
                 </div>
-                <div id="pricing-note" class="pricing-warning">Cached Avatar-Replays = fair use inklusive. Live-AI-Minuten = dynamische Gespräche mit Avatar, Chat und Voice.</div>
             </div>
             <div id="messages" class="messages">
                 <div class="empty-state">Noch keine Unterhaltung. Starte mit einer Nachricht, prüfe Handoffs oder nutze rechts einen direkten Repo-Befehl für eine technische Sichtung.</div>
