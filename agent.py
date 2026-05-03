@@ -399,6 +399,52 @@ class CostPlanRecommendationResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class CommercialPlanTemplate(BaseModel):
+    name: str
+    monthly_price_eur: float = Field(ge=0.0)
+    setup_fee_eur: float = Field(ge=0.0)
+    included_live_ai_minutes: int = Field(ge=0)
+    overage_per_minute_eur: float | None = Field(default=None, ge=0.0)
+    target_customer: str = ""
+
+
+class CommercialPricingInput(BaseModel):
+    projected_cost_per_live_ai_minute_eur: float = Field(default=0.25, ge=0.0)
+    target_gross_margin: float = Field(default=0.7, ge=0.0, le=0.95)
+    safety_multiplier: float = Field(default=1.5, ge=1.0, le=10.0)
+    plans: list[CommercialPlanTemplate] = Field(default_factory=lambda: [
+        CommercialPlanTemplate(name="Starter", monthly_price_eur=499.0, setup_fee_eur=990.0, included_live_ai_minutes=200, overage_per_minute_eur=0.99, target_customer="kleine Shops / erste Live-Beratung"),
+        CommercialPlanTemplate(name="Growth", monthly_price_eur=999.0, setup_fee_eur=2900.0, included_live_ai_minutes=800, overage_per_minute_eur=0.79, target_customer="Shops mit ernstem Traffic"),
+        CommercialPlanTemplate(name="Premium", monthly_price_eur=1990.0, setup_fee_eur=5900.0, included_live_ai_minutes=2000, overage_per_minute_eur=0.59, target_customer="starke Shops / Multi-Language / erklaerungsbeduerftige Angebote"),
+        CommercialPlanTemplate(name="Enterprise", monthly_price_eur=4900.0, setup_fee_eur=10000.0, included_live_ai_minutes=5000, overage_per_minute_eur=None, target_customer="Multi-Store, SLA, Custom Avatar, Integrationen"),
+    ])
+
+
+class CommercialPlanResult(BaseModel):
+    name: str
+    monthly_price_eur: float
+    setup_fee_eur: float
+    included_live_ai_minutes: int
+    overage_per_minute_eur: float | None
+    projected_provider_cost_eur: float
+    projected_gross_margin: float
+    break_even_minutes: int
+    overage_margin: float | None
+    margin_ok: bool
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CommercialPricingResult(BaseModel):
+    ok: bool
+    currency: str = "EUR"
+    pricing_note: str = "Commercial pricing is based on Live-AI-Minutes. Provider cost per minute must be replaced with measured real data before final pricing."
+    projected_cost_per_live_ai_minute_eur: float
+    target_gross_margin: float
+    safety_multiplier: float
+    plans: list[CommercialPlanResult]
+    warnings: list[str] = Field(default_factory=list)
+
+
 def _ensure_handoff_dir():
     os.makedirs(HANDOFF_DIR, exist_ok=True)
 
@@ -564,6 +610,59 @@ def estimate_cost(event: CostEstimateInput) -> CostEstimateResult:
         },
         cache_status=cache_status,
         write_ledger=event.write_ledger,
+    )
+
+
+def calculate_commercial_pricing(input_data: CommercialPricingInput) -> CommercialPricingResult:
+    effective_cost_per_minute = input_data.projected_cost_per_live_ai_minute_eur * input_data.safety_multiplier
+    warnings: list[str] = []
+    if input_data.projected_cost_per_live_ai_minute_eur == 0:
+        warnings.append("missing_real_cost_per_minute: replace default with measured provider cost before final pricing")
+    if input_data.projected_cost_per_live_ai_minute_eur == 0.25:
+        warnings.append("default_cost_per_minute_used: run real Live-AI-Minute tests before final pricing")
+
+    plan_results: list[CommercialPlanResult] = []
+    for plan in input_data.plans:
+        projected_provider_cost = effective_cost_per_minute * plan.included_live_ai_minutes
+        projected_margin = 1.0
+        if plan.monthly_price_eur > 0:
+            projected_margin = max(-1.0, min(1.0, 1.0 - (projected_provider_cost / plan.monthly_price_eur)))
+        if effective_cost_per_minute > 0:
+            break_even_minutes = int(plan.monthly_price_eur / effective_cost_per_minute)
+        else:
+            break_even_minutes = 0
+        overage_margin = None
+        if plan.overage_per_minute_eur is not None and plan.overage_per_minute_eur > 0:
+            overage_margin = max(-1.0, min(1.0, 1.0 - (effective_cost_per_minute / plan.overage_per_minute_eur)))
+        plan_warnings: list[str] = []
+        margin_ok = projected_margin >= input_data.target_gross_margin
+        if not margin_ok:
+            plan_warnings.append("included_minutes_margin_below_target")
+        if overage_margin is not None and overage_margin < input_data.target_gross_margin:
+            plan_warnings.append("overage_margin_below_target")
+        if break_even_minutes and plan.included_live_ai_minutes > break_even_minutes:
+            plan_warnings.append("included_minutes_exceed_break_even")
+        plan_results.append(CommercialPlanResult(
+            name=plan.name,
+            monthly_price_eur=round(plan.monthly_price_eur, 2),
+            setup_fee_eur=round(plan.setup_fee_eur, 2),
+            included_live_ai_minutes=plan.included_live_ai_minutes,
+            overage_per_minute_eur=plan.overage_per_minute_eur,
+            projected_provider_cost_eur=round(projected_provider_cost, 2),
+            projected_gross_margin=round(projected_margin, 6),
+            break_even_minutes=break_even_minutes,
+            overage_margin=round(overage_margin, 6) if overage_margin is not None else None,
+            margin_ok=margin_ok,
+            warnings=plan_warnings,
+        ))
+
+    return CommercialPricingResult(
+        ok=True,
+        projected_cost_per_live_ai_minute_eur=input_data.projected_cost_per_live_ai_minute_eur,
+        target_gross_margin=input_data.target_gross_margin,
+        safety_multiplier=input_data.safety_multiplier,
+        plans=plan_results,
+        warnings=warnings,
     )
 
 
@@ -2819,6 +2918,13 @@ async def get_handoffs(limit: int = 25):
         "limit": safe_limit,
         "items": records,
     }
+
+
+@app.post("/api/cost-ledger/commercial-pricing")
+async def get_commercial_pricing(input_data: CommercialPricingInput, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="commercial pricing is local-only")
+    return calculate_commercial_pricing(input_data).model_dump()
 
 
 @app.get("/api/cost-ledger/plan-templates")
