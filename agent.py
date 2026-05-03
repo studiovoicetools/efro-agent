@@ -305,6 +305,62 @@ def _costly_watchdog_checks_enabled() -> bool:
     return _env_flag("EFRO_ENABLE_COSTLY_WATCHDOG_CHECKS", "0")
 
 
+def _watchdog_cost_manifest() -> list[dict[str, str]]:
+    return [
+        {
+            "check": "widget_voice_signed_url_prod",
+            "provider_risk": "Mascot/voice-provider signed URL runtime",
+            "trigger": "POST widget /api/get-signed-url",
+        },
+        {
+            "check": "brain_live_prod",
+            "provider_risk": "Brain/LLM/vector/database runtime",
+            "trigger": "POST brain /api/brain/chat",
+        },
+        {
+            "check": "shopify_product_inventory",
+            "provider_risk": "Brain/LLM/vector/database runtime",
+            "trigger": "POST brain /api/brain/chat",
+        },
+        {
+            "check": "brain_answer_quality_smoke",
+            "provider_risk": "multiple Brain/LLM/provider calls",
+            "trigger": "4x POST brain /api/brain/chat",
+        },
+        {
+            "check": "widget_chat_voice_cache_parity",
+            "provider_risk": "Widget answer may invoke Brain/LLM; signed URL may invoke Mascot; paid TTS can invoke ElevenLabs when separately enabled",
+            "trigger": "POST widget /api/nonshopify-answer + /api/get-signed-url + optional /api/tts-with-visemes",
+        },
+    ]
+
+
+def _check_watchdog_cost_policy() -> dict[str, Any]:
+    enabled = _costly_watchdog_checks_enabled()
+    manifest = _watchdog_cost_manifest()
+    evidence = _clip_text(json.dumps({
+        "zero_cost_default": not enabled,
+        "costly_checks_enabled": enabled,
+        "enable_flag": "EFRO_ENABLE_COSTLY_WATCHDOG_CHECKS=true",
+        "paid_tts_extra_flag": "EFRO_ENABLE_PAID_TTS_WATCHDOG=true",
+        "cost_sources": manifest,
+    }, ensure_ascii=False), 1300)
+    return _run_observation_check(
+        check_name="watchdog_cost_policy",
+        target="internal:cost-policy",
+        status="warn" if enabled else "ok",
+        kind="cost_policy",
+        evidence=evidence,
+        expected="Default watchdog must be zero-cost. Any provider/LLM/voice/runtime probes must be explicit opt-in and visible in evidence.",
+        observed=(
+            "costly_checks_enabled=true; provider calls may run; review cost_sources before allowing"
+            if enabled
+            else "costly_checks_enabled=false; zero-cost default enforced"
+        ),
+        duration_ms=0,
+    )
+
+
 def _zero_cost_skip_check(check_name: str, target: str, kind: str, reason: str) -> dict[str, Any]:
     return _run_observation_check(
         check_name=check_name,
@@ -1623,6 +1679,7 @@ def _check_control_center_watchdog_contract() -> dict[str, Any]:
 
 def _efro_watchdog_checks() -> list[dict[str, Any]]:
     return [
+        _check_watchdog_cost_policy(),
         _check_local_health_contract(),
         _check_public_health_contract(),
         _check_widget_voice_signed_url_prod(),
