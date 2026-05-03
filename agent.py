@@ -245,7 +245,13 @@ class CostLedgerSummary(BaseModel):
     currency: str
     by_provider: dict[str, dict[str, Any]]
     by_endpoint: dict[str, dict[str, Any]]
+    by_shop: dict[str, dict[str, Any]] = Field(default_factory=dict)
     by_cache_status: dict[str, int]
+    cache_hit_rate: float = 0.0
+    cache_miss_rate: float = 0.0
+    billable_event_count: int = 0
+    zero_cost_cached_event_count: int = 0
+    cache_miss_estimated_cost: float = 0.0
     latest: list[dict[str, Any]]
 
 
@@ -337,12 +343,34 @@ def read_cost_ledger_records(limit: int = 250) -> list[dict[str, Any]]:
 
 def _add_cost_bucket(target: dict[str, dict[str, Any]], key: str, record: dict[str, Any]) -> None:
     bucket_key = key or "unknown"
-    bucket = target.setdefault(bucket_key, {"count": 0, "estimated_cost": 0.0, "tokens_in": 0, "tokens_out": 0, "characters": 0})
+    bucket = target.setdefault(bucket_key, {
+        "count": 0,
+        "estimated_cost": 0.0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "characters": 0,
+        "cache_hit_count": 0,
+        "cache_miss_count": 0,
+        "cache_unknown_count": 0,
+        "cache_hit_rate": 0.0,
+        "cache_miss_estimated_cost": 0.0,
+    })
+    estimated_cost = float(record.get("estimated_cost") or 0)
+    cache_status = str(record.get("cache_status") or "unknown").lower()
     bucket["count"] += 1
-    bucket["estimated_cost"] += float(record.get("estimated_cost") or 0)
+    bucket["estimated_cost"] += estimated_cost
     bucket["tokens_in"] += int(record.get("tokens_in") or 0)
     bucket["tokens_out"] += int(record.get("tokens_out") or 0)
     bucket["characters"] += int(record.get("characters") or 0)
+    if cache_status == "hit":
+        bucket["cache_hit_count"] += 1
+    elif cache_status == "miss":
+        bucket["cache_miss_count"] += 1
+        bucket["cache_miss_estimated_cost"] += estimated_cost
+    else:
+        bucket["cache_unknown_count"] += 1
+    if bucket["count"]:
+        bucket["cache_hit_rate"] = round(bucket["cache_hit_count"] / bucket["count"], 6)
 
 
 def _cost_rate_card() -> dict[str, dict[str, Any]]:
@@ -433,21 +461,45 @@ def summarize_cost_ledger(limit: int = 250) -> CostLedgerSummary:
     records = read_cost_ledger_records(limit=limit)
     by_provider: dict[str, dict[str, Any]] = {}
     by_endpoint: dict[str, dict[str, Any]] = {}
+    by_shop: dict[str, dict[str, Any]] = {}
     by_cache_status: dict[str, int] = {}
     total = 0.0
+    hit_count = 0
+    miss_count = 0
+    billable_event_count = 0
+    zero_cost_cached_event_count = 0
+    cache_miss_estimated_cost = 0.0
     for record in records:
-        total += float(record.get("estimated_cost") or 0)
+        estimated_cost = float(record.get("estimated_cost") or 0)
+        cache_status = str(record.get("cache_status") or "unknown").lower()
+        total += estimated_cost
         _add_cost_bucket(by_provider, str(record.get("provider") or "unknown"), record)
         _add_cost_bucket(by_endpoint, str(record.get("endpoint") or "unknown"), record)
-        cache_status = str(record.get("cache_status") or "unknown")
+        _add_cost_bucket(by_shop, str(record.get("shop_domain") or "unknown"), record)
         by_cache_status[cache_status] = by_cache_status.get(cache_status, 0) + 1
+        if estimated_cost > 0:
+            billable_event_count += 1
+        if cache_status == "hit":
+            hit_count += 1
+            if estimated_cost == 0:
+                zero_cost_cached_event_count += 1
+        elif cache_status == "miss":
+            miss_count += 1
+            cache_miss_estimated_cost += estimated_cost
+    count = len(records)
     return CostLedgerSummary(
-        count=len(records),
+        count=count,
         estimated_total_cost=round(total, 8),
         currency="USD",
         by_provider=by_provider,
         by_endpoint=by_endpoint,
+        by_shop=by_shop,
         by_cache_status=by_cache_status,
+        cache_hit_rate=round(hit_count / count, 6) if count else 0.0,
+        cache_miss_rate=round(miss_count / count, 6) if count else 0.0,
+        billable_event_count=billable_event_count,
+        zero_cost_cached_event_count=zero_cost_cached_event_count,
+        cache_miss_estimated_cost=round(cache_miss_estimated_cost, 8),
         latest=list(reversed(records[-25:])),
     )
 
