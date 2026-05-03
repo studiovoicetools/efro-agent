@@ -289,6 +289,39 @@ class CostEstimateResult(BaseModel):
     ledger_record: dict[str, Any] | None = None
 
 
+class CostProjectionInput(BaseModel):
+    limit: int = Field(default=250, ge=1, le=5000)
+    projected_daily_events: int = Field(default=100, ge=1)
+    projected_monthly_events: int | None = Field(default=None, ge=1)
+    target_gross_margin: float = Field(default=0.7, ge=0.0, le=0.95)
+    safety_multiplier: float = Field(default=1.25, ge=1.0, le=10.0)
+    min_monthly_price_floor: float = Field(default=0.0, ge=0.0)
+
+
+class CostProjectionResult(BaseModel):
+    ok: bool
+    currency: str
+    source_event_count: int
+    cost_per_event: float
+    cost_per_billable_event: float
+    cost_per_100_events: float
+    cost_per_1000_events: float
+    projected_daily_events: int
+    projected_daily_cost: float
+    projected_monthly_events: int
+    projected_monthly_cost: float
+    recommended_min_monthly_price: float
+    target_gross_margin: float
+    safety_multiplier: float
+    cache_hit_rate: float
+    cache_miss_rate: float
+    cache_miss_estimated_cost: float
+    billable_event_count: int
+    zero_cost_cached_event_count: int
+    by_shop: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+
+
 def _ensure_handoff_dir():
     os.makedirs(HANDOFF_DIR, exist_ok=True)
 
@@ -454,6 +487,51 @@ def estimate_cost(event: CostEstimateInput) -> CostEstimateResult:
         },
         cache_status=cache_status,
         write_ledger=event.write_ledger,
+    )
+
+
+def project_costs(input_data: CostProjectionInput) -> CostProjectionResult:
+    summary = summarize_cost_ledger(limit=input_data.limit)
+    count = max(0, int(summary.count or 0))
+    monthly_events = input_data.projected_monthly_events or (input_data.projected_daily_events * 30)
+    total_cost = float(summary.estimated_total_cost or 0)
+    billable_count = max(0, int(summary.billable_event_count or 0))
+    cost_per_event = (total_cost / count) if count else 0.0
+    cost_per_billable_event = (total_cost / billable_count) if billable_count else 0.0
+    projected_daily_cost = cost_per_event * input_data.projected_daily_events
+    projected_monthly_cost = cost_per_event * monthly_events
+    margin_divisor = max(0.01, 1.0 - input_data.target_gross_margin)
+    recommended = (projected_monthly_cost * input_data.safety_multiplier) / margin_divisor
+    recommended = max(recommended, input_data.min_monthly_price_floor)
+    warnings: list[str] = []
+    if count < 25:
+        warnings.append("small_sample_size: collect more ledger events before using this for final pricing")
+    if summary.cache_hit_rate < 0.5 and count > 0:
+        warnings.append("low_cache_hit_rate: improve caching before scaling")
+    if total_cost == 0 and count > 0:
+        warnings.append("zero_rate_card_or_zero_cost: configure real provider rates before pricing decisions")
+    return CostProjectionResult(
+        ok=True,
+        currency=summary.currency,
+        source_event_count=count,
+        cost_per_event=round(cost_per_event, 8),
+        cost_per_billable_event=round(cost_per_billable_event, 8),
+        cost_per_100_events=round(cost_per_event * 100, 8),
+        cost_per_1000_events=round(cost_per_event * 1000, 8),
+        projected_daily_events=input_data.projected_daily_events,
+        projected_daily_cost=round(projected_daily_cost, 8),
+        projected_monthly_events=monthly_events,
+        projected_monthly_cost=round(projected_monthly_cost, 8),
+        recommended_min_monthly_price=round(recommended, 2),
+        target_gross_margin=input_data.target_gross_margin,
+        safety_multiplier=input_data.safety_multiplier,
+        cache_hit_rate=summary.cache_hit_rate,
+        cache_miss_rate=summary.cache_miss_rate,
+        cache_miss_estimated_cost=summary.cache_miss_estimated_cost,
+        billable_event_count=summary.billable_event_count,
+        zero_cost_cached_event_count=summary.zero_cost_cached_event_count,
+        by_shop=summary.by_shop,
+        warnings=warnings,
     )
 
 
@@ -2538,6 +2616,13 @@ async def get_handoffs(limit: int = 25):
         "limit": safe_limit,
         "items": records,
     }
+
+
+@app.post("/api/cost-ledger/projection")
+async def get_cost_ledger_projection(input_data: CostProjectionInput, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost projection is local-only")
+    return project_costs(input_data).model_dump()
 
 
 @app.get("/api/cost-ledger/rate-card")
