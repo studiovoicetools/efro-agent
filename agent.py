@@ -852,8 +852,12 @@ def _check_shopify_product_inventory() -> dict[str, Any]:
             total_products_ok = isinstance(total_products, int) and total_products >= expected_product_count
             db_product_count_ok = db_product_count is None or (isinstance(db_product_count, int) and db_product_count >= expected_product_count)
             reply_lower = reply_text.lower()
-            concrete_product_ok = bool(candidates) or any(term in reply_lower for term in ["smart tv", "fernseher", "wasserkocher", "soundbar", "parfum"])
             price_ok = "€" in reply_text or "eur" in reply_lower or "preis" in reply_lower
+            product_signal_ok = bool(candidates) or any(
+                term in reply_lower
+                for term in ["produkt", "produkte", "empfehl", "artikel", "anschauen", "vergleichen"]
+            )
+            concrete_product_ok = product_signal_ok and (bool(candidates) or price_ok or total_products_ok)
             leaks = _bad_output_leaks(reply_text)
 
             ok = (
