@@ -1105,7 +1105,9 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
     tts_url = f"{widget_base}/api/tts-with-visemes"
     signed_url = f"{widget_base}/api/get-signed-url"
 
+    current_stage = "init"
     try:
+        current_stage = "answer"
         answer_started = time.time()
         answer_body = json.dumps({
             "shop": shop_domain,
@@ -1140,6 +1142,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
         parity_hash_ok = not parity_hash or parity_hash == reply_hash
         reply_ok = len(reply_text.strip()) >= 40 and not _bad_output_leaks(reply_text)
 
+        current_stage = "tts"
         tts_started = time.time()
         tts_body = json.dumps({"text": spoken_text or reply_text, "language": "de", "shopDomain": shop_domain}).encode("utf-8")
         tts_req = urllib_request.Request(
@@ -1162,6 +1165,7 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
         audio_ok = tts_status == 200 and bool(audio_events)
         tts_event_contract_ok = bool(audio_events) and bool(viseme_events) and bool(done_events)
 
+        current_stage = "signed_url"
         signed_started = time.time()
         signed_body = json.dumps({
             "dynamicVariables": {
@@ -1249,14 +1253,18 @@ def _check_widget_chat_voice_cache_parity() -> dict[str, Any]:
             duration_ms=int((time.time() - started) * 1000),
         )
     except Exception as e:
+        evidence = _clip_text(
+            f"stage={current_stage}; exception={e}; answer_url={answer_url}; tts_url={tts_url}; signed_url={signed_url}",
+            700,
+        )
         return _run_observation_check(
             check_name="widget_chat_voice_cache_parity",
             target=widget_base,
             status="error",
             kind="runtime_parity",
-            evidence=f"exception={e}",
+            evidence=evidence,
             expected="Widget parity probe completes through answer, TTS/viseme and signed-url endpoints",
-            observed=f"exception={e}",
+            observed=evidence,
             duration_ms=int((time.time() - started) * 1000),
         )
 
