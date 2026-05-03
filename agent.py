@@ -322,6 +322,36 @@ class CostProjectionResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class CostLimitRecommendationInput(BaseModel):
+    limit: int = Field(default=250, ge=1, le=5000)
+    monthly_price: float = Field(default=29.0, ge=0.0)
+    target_gross_margin: float = Field(default=0.7, ge=0.0, le=0.95)
+    safety_multiplier: float = Field(default=1.25, ge=1.0, le=10.0)
+    minimum_cache_hit_rate: float = Field(default=0.7, ge=0.0, le=1.0)
+    projected_daily_events: int = Field(default=100, ge=1)
+    projected_monthly_events: int | None = Field(default=None, ge=1)
+
+
+class CostLimitRecommendationResult(BaseModel):
+    ok: bool
+    currency: str
+    monthly_price: float
+    target_gross_margin: float
+    safety_multiplier: float
+    source_event_count: int
+    cost_per_event: float
+    safe_monthly_event_limit: int
+    safe_daily_event_limit: int
+    projected_monthly_events: int
+    projected_monthly_cost: float
+    projected_margin: float
+    cache_hit_rate: float
+    cache_hit_rate_ok: bool
+    hard_cap_recommended: bool
+    warnings: list[str] = Field(default_factory=list)
+    projection: dict[str, Any]
+
+
 def _ensure_handoff_dir():
     os.makedirs(HANDOFF_DIR, exist_ok=True)
 
@@ -487,6 +517,62 @@ def estimate_cost(event: CostEstimateInput) -> CostEstimateResult:
         },
         cache_status=cache_status,
         write_ledger=event.write_ledger,
+    )
+
+
+def recommend_cost_limits(input_data: CostLimitRecommendationInput) -> CostLimitRecommendationResult:
+    projection_input = CostProjectionInput(
+        limit=input_data.limit,
+        projected_daily_events=input_data.projected_daily_events,
+        projected_monthly_events=input_data.projected_monthly_events,
+        target_gross_margin=input_data.target_gross_margin,
+        safety_multiplier=input_data.safety_multiplier,
+        min_monthly_price_floor=input_data.monthly_price,
+    )
+    projection = project_costs(projection_input)
+    cost_per_event = max(0.0, float(projection.cost_per_event or 0.0))
+    allowed_cost_budget = input_data.monthly_price * max(0.0, 1.0 - input_data.target_gross_margin)
+    adjusted_cost_per_event = cost_per_event * max(1.0, input_data.safety_multiplier)
+    if adjusted_cost_per_event > 0:
+        safe_monthly_event_limit = int(allowed_cost_budget / adjusted_cost_per_event)
+    else:
+        safe_monthly_event_limit = 0
+    safe_daily_event_limit = int(safe_monthly_event_limit / 30) if safe_monthly_event_limit else 0
+    projected_monthly_cost = float(projection.projected_monthly_cost or 0.0)
+    projected_margin = 1.0
+    if input_data.monthly_price > 0:
+        projected_margin = max(-1.0, min(1.0, 1.0 - (projected_monthly_cost / input_data.monthly_price)))
+    warnings = list(projection.warnings)
+    cache_hit_rate_ok = projection.cache_hit_rate >= input_data.minimum_cache_hit_rate
+    if not cache_hit_rate_ok:
+        warnings.append("cache_hit_rate_below_minimum: improve caching or lower included usage")
+    if safe_monthly_event_limit and projection.projected_monthly_events > safe_monthly_event_limit:
+        warnings.append("projected_usage_exceeds_safe_limit: hard cap or higher plan required")
+    if projection.source_event_count < 25:
+        warnings.append("pricing_not_final: sample size is too small for final limits")
+    hard_cap_recommended = bool(
+        (safe_monthly_event_limit and projection.projected_monthly_events > safe_monthly_event_limit)
+        or not cache_hit_rate_ok
+        or projection.source_event_count < 25
+    )
+    return CostLimitRecommendationResult(
+        ok=True,
+        currency=projection.currency,
+        monthly_price=round(input_data.monthly_price, 2),
+        target_gross_margin=input_data.target_gross_margin,
+        safety_multiplier=input_data.safety_multiplier,
+        source_event_count=projection.source_event_count,
+        cost_per_event=projection.cost_per_event,
+        safe_monthly_event_limit=safe_monthly_event_limit,
+        safe_daily_event_limit=safe_daily_event_limit,
+        projected_monthly_events=projection.projected_monthly_events,
+        projected_monthly_cost=projection.projected_monthly_cost,
+        projected_margin=round(projected_margin, 6),
+        cache_hit_rate=projection.cache_hit_rate,
+        cache_hit_rate_ok=cache_hit_rate_ok,
+        hard_cap_recommended=hard_cap_recommended,
+        warnings=warnings,
+        projection=projection.model_dump(),
     )
 
 
@@ -2616,6 +2702,13 @@ async def get_handoffs(limit: int = 25):
         "limit": safe_limit,
         "items": records,
     }
+
+
+@app.post("/api/cost-ledger/recommend-limits")
+async def get_cost_limit_recommendation(input_data: CostLimitRecommendationInput, request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="cost limit recommendation is local-only")
+    return recommend_cost_limits(input_data).model_dump()
 
 
 @app.post("/api/cost-ledger/projection")
