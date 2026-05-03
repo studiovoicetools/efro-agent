@@ -476,13 +476,14 @@ def append_cost_ledger_event(event: CostLedgerEvent) -> CostLedgerRecord:
     return record
 
 
-def read_cost_ledger_records(limit: int = 250) -> list[dict[str, Any]]:
+def read_cost_ledger_records(limit: int = 250, shop_domain: str | None = None) -> list[dict[str, Any]]:
     if not os.path.exists(COST_LEDGER_FILE):
         return []
     safe_limit = max(1, min(limit, 5000))
+    normalized_shop = (shop_domain or "").strip().lower()
     with COST_LEDGER_LOCK:
         with open(COST_LEDGER_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-safe_limit:]
+            lines = f.readlines()
     records: list[dict[str, Any]] = []
     for line in lines:
         line = line.strip()
@@ -491,10 +492,12 @@ def read_cost_ledger_records(limit: int = 250) -> list[dict[str, Any]]:
         try:
             parsed = json.loads(line)
             if isinstance(parsed, dict):
+                if normalized_shop and str(parsed.get("shop_domain") or "").strip().lower() != normalized_shop:
+                    continue
                 records.append(parsed)
         except Exception:
             continue
-    return records
+    return records[-safe_limit:]
 
 
 def _add_cost_bucket(target: dict[str, dict[str, Any]], key: str, record: dict[str, Any]) -> None:
@@ -837,8 +840,8 @@ def project_costs(input_data: CostProjectionInput) -> CostProjectionResult:
     )
 
 
-def summarize_cost_ledger(limit: int = 250) -> CostLedgerSummary:
-    records = read_cost_ledger_records(limit=limit)
+def summarize_cost_ledger(limit: int = 250, shop_domain: str | None = None) -> CostLedgerSummary:
+    records = read_cost_ledger_records(limit=limit, shop_domain=shop_domain)
     by_provider: dict[str, dict[str, Any]] = {}
     by_endpoint: dict[str, dict[str, Any]] = {}
     by_shop: dict[str, dict[str, Any]] = {}
@@ -2927,6 +2930,17 @@ async def get_commercial_pricing(input_data: CommercialPricingInput, request: Re
     return calculate_commercial_pricing(input_data).model_dump()
 
 
+@app.get("/admin/costs/data")
+async def get_admin_costs_data(shop_domain: str | None = None, limit: int = 250, projected_cost_per_live_ai_minute_eur: float = 0.25, safety_multiplier: float = 1.5, target_gross_margin: float = 0.7):
+    safe_limit = max(1, min(limit, 5000))
+    all_records = read_cost_ledger_records(limit=5000)
+    available_shops = sorted({str(item.get("shop_domain") or "unknown") for item in all_records})
+    selected_shop = (shop_domain or (available_shops[0] if available_shops else "")).strip() or None
+    summary = summarize_cost_ledger(limit=safe_limit, shop_domain=selected_shop)
+    commercial = calculate_commercial_pricing(CommercialPricingInput(projected_cost_per_live_ai_minute_eur=projected_cost_per_live_ai_minute_eur, safety_multiplier=safety_multiplier, target_gross_margin=target_gross_margin))
+    return {"ok": True, "selected_shop_domain": selected_shop, "available_shops": available_shops, "ledger": {"ok": True, "limit": safe_limit, "shop_domain": selected_shop, "summary": summary.model_dump()}, "commercial": commercial.model_dump()}
+
+
 @app.get("/api/cost-ledger/plan-templates")
 async def get_cost_plan_templates(request: Request):
     if not _is_local_request(request):
@@ -3019,12 +3033,12 @@ async def get_cost_ledger_events(request: Request, limit: int = 100):
 
 
 @app.get("/api/cost-ledger/summary")
-async def get_cost_ledger_summary(request: Request, limit: int = 250):
+async def get_cost_ledger_summary(request: Request, limit: int = 250, shop_domain: str | None = None):
     if not _is_local_request(request):
         raise HTTPException(status_code=403, detail="cost ledger summary is local-only")
     safe_limit = max(1, min(limit, 5000))
-    summary = summarize_cost_ledger(limit=safe_limit)
-    return {"ok": True, "limit": safe_limit, "summary": summary.model_dump()}
+    summary = summarize_cost_ledger(limit=safe_limit, shop_domain=shop_domain)
+    return {"ok": True, "limit": safe_limit, "shop_domain": shop_domain, "summary": summary.model_dump()}
 
 
 @app.get("/api/watchdog/status")
@@ -3530,6 +3544,7 @@ async def admin_costs():
     <div class="actions">
         <button class="btn" id="refresh">Aktualisieren</button>
         <button class="btn" id="copy">Übersicht kopieren</button>
+        <label class="label">Shop <input id="shopDomain" type="text" value="" placeholder="alle/erster Shop"></label>
         <label class="label">Kosten/Live-Minute € <input id="costMinute" type="number" step="0.01" value="0.25"></label>
         <label class="label">Safety <input id="safety" type="number" step="0.1" value="1.5"></label>
         <label class="label">Zielmarge <input id="margin" type="number" step="0.05" value="0.7"></label>
@@ -3563,6 +3578,7 @@ const statusMetrics = document.getElementById('statusMetrics');
 const commercialRows = document.getElementById('commercialRows');
 const ledgerRaw = document.getElementById('ledgerRaw');
 const commercialRaw = document.getElementById('commercialRaw');
+const shopDomain = document.getElementById('shopDomain');
 const costMinute = document.getElementById('costMinute');
 const safety = document.getElementById('safety');
 const margin = document.getElementById('margin');
@@ -3571,7 +3587,9 @@ function money(v, currency='€') { return `${Number(v || 0).toLocaleString('de-
 function pct(v) { return `${(Number(v || 0) * 100).toFixed(2)}%`; }
 function renderMetrics(watchdog, ledger) {
  const s = ledger.summary || {};
+ const selectedShop = ledger.shop_domain || 'alle/keine Daten';
  statusMetrics.innerHTML = `
+  <div><div class="label">Gemessener Shop</div><div class="value">${selectedShop}</div></div>
   <div><div class="label">Watchdog Billing</div><div class="value">${watchdog.billing_mode || 'n/a'}</div></div>
   <div><div class="label">Metered Checks</div><div class="value">${watchdog.metered_checks_enabled ? 'AN' : 'AUS'}</div></div>
   <div><div class="label">Ledger Kosten</div><div class="value">${s.estimated_total_cost || 0} ${s.currency || 'USD'}</div></div>
@@ -3588,24 +3606,22 @@ function renderCommercial(data) {
  }
 }
 async function loadAll() {
- const commercialPayload = { projected_cost_per_live_ai_minute_eur: Number(costMinute.value || 0), safety_multiplier: Number(safety.value || 1), target_gross_margin: Number(margin.value || 0.7) };
- const [watchdogResp, ledgerResp, commercialResp] = await Promise.all([
-  fetch('/api/watchdog/summary?shop=efro'),
-  fetch('/api/cost-ledger/summary'),
-  fetch('/api/cost-ledger/commercial-pricing', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(commercialPayload) })
- ]);
- const watchdog = await watchdogResp.json();
- const ledger = await ledgerResp.json();
- const commercial = await commercialResp.json();
+ const url = `/admin/costs/data?shop_domain=${encodeURIComponent(shopDomain.value || '')}&projected_cost_per_live_ai_minute_eur=${encodeURIComponent(costMinute.value || '0.25')}&safety_multiplier=${encodeURIComponent(safety.value || '1.5')}&target_gross_margin=${encodeURIComponent(margin.value || '0.7')}`;
+ const resp = await fetch(url);
+ const data = await resp.json();
+ const watchdog = data.watchdog || {};
+ const ledger = data.ledger || {};
+ const commercial = data.commercial || {};
+ if (!shopDomain.value && data.selected_shop_domain) shopDomain.value = data.selected_shop_domain;
  renderMetrics(watchdog, ledger);
  renderCommercial(commercial);
- ledgerRaw.textContent = JSON.stringify(ledger.summary || ledger, null, 2);
+ ledgerRaw.textContent = JSON.stringify({selected_shop_domain: data.selected_shop_domain, available_shops: data.available_shops, ...(ledger.summary || ledger)}, null, 2);
  commercialRaw.textContent = JSON.stringify(commercial, null, 2);
- latestSnapshot = `Watchdog: ${watchdog.billing_mode}\nMetered: ${watchdog.metered_checks_enabled}\nLedger Kosten: ${(ledger.summary||{}).estimated_total_cost} ${(ledger.summary||{}).currency}\nCommercial Pricing:\n${(commercial.plans||[]).map(p => `${p.name}: ${p.monthly_price_eur}€/Monat, ${p.included_live_ai_minutes} Min, Marge ${pct(p.projected_gross_margin)}, Warnungen ${(p.warnings||[]).join('|') || '-'}`).join('\n')}`;
+ latestSnapshot = `Shop: ${data.selected_shop_domain || 'n/a'}\nWatchdog: ${watchdog.billing_mode}\nMetered: ${watchdog.metered_checks_enabled}\nLedger Kosten: ${(ledger.summary||{}).estimated_total_cost} ${(ledger.summary||{}).currency}\nCommercial Pricing:\n${(commercial.plans||[]).map(p => `${p.name}: ${p.monthly_price_eur}€/Monat, ${p.included_live_ai_minutes} Min, Marge ${pct(p.projected_gross_margin)}, Warnungen ${(p.warnings||[]).join('|') || '-'}`).join('\n')}`;
 }
 document.getElementById('refresh').onclick = loadAll;
 document.getElementById('copy').onclick = async () => navigator.clipboard.writeText(latestSnapshot || 'Noch keine Daten geladen.');
-[costMinute, safety, margin].forEach(el => el.addEventListener('change', loadAll));
+[shopDomain, costMinute, safety, margin].forEach(el => el.addEventListener('change', loadAll));
 loadAll().catch(err => { commercialRaw.textContent = err.message; });
 </script>
 </body>
