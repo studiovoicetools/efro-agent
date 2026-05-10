@@ -30,15 +30,37 @@ def load_tasks(path: Path = TASKS_JSON) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def write_tasks_with_backup(tasks: list[dict[str, Any]], target: Path = TASKS_JSON) -> Path:
+def queue_write_approved() -> None:
     if os.environ.get("EFRO_FLEET_ENABLE_QUEUE_WRITE") != "true":
         raise RuntimeError("Queue write blocked: EFRO_FLEET_ENABLE_QUEUE_WRITE must be true.")
     if os.environ.get("EFRO_FLEET_OWNER_APPROVED") != "true":
         raise RuntimeError("Queue write blocked: EFRO_FLEET_OWNER_APPROVED must be true.")
+
+
+def write_tasks_with_backup(tasks: list[dict[str, Any]], target: Path = TASKS_JSON) -> Path:
+    queue_write_approved()
     backup = target.with_suffix(f".json.bak-fleet-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
     shutil.copy2(target, backup)
     target.write_text(json.dumps(tasks, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return backup
+
+
+def restore_queue_from_backup(backup: Path, target: Path = TASKS_JSON) -> Path:
+    queue_write_approved()
+
+    backup = backup.resolve()
+    target = target.resolve()
+    expected_prefix = str(target.with_suffix(".json")) + ".bak-fleet-"
+
+    if not backup.exists():
+        raise RuntimeError(f"Restore blocked: backup not found: {backup}")
+    if not str(backup).startswith(expected_prefix):
+        raise RuntimeError("Restore blocked: backup path is not a fleet queue backup.")
+
+    pre_restore = target.with_suffix(f".json.bak-pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(target, pre_restore)
+    shutil.copy2(backup, target)
+    return pre_restore
 
 
 def status_label(ok: bool, blockers: list[str]) -> str:
@@ -53,12 +75,50 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EFRO Worker Fleet Controller V1")
     parser.add_argument("--candidate", default="", help="Optional candidate tasks JSON file to validate.")
     parser.add_argument("--apply", action="store_true", help="Apply candidate tasks only with explicit environment approval.")
+    parser.add_argument("--restore-backup", default="", help="Restore runtime queue from a fleet-created backup with explicit environment approval.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.restore_backup:
+        restore_source = Path(args.restore_backup).resolve()
+        lines = [
+            "# EFRO Worker Fleet Controller Status",
+            "",
+            f"Generated: {now()}",
+            "",
+            "Mode: V1 queue-restore. No push. No deploy.",
+            f"Restore source: `{restore_source}`",
+            "",
+            "## Queue restore",
+            "",
+        ]
+        result: dict[str, Any] = {
+            "generated_at": now(),
+            "mode": "queue-restore",
+            "restore_source": str(restore_source),
+            "restored": False,
+            "pre_restore_backup": "",
+            "error": "",
+        }
+        try:
+            pre_restore = restore_queue_from_backup(restore_source)
+            result["restored"] = True
+            result["pre_restore_backup"] = str(pre_restore)
+            lines.append(f"Restored queue. Pre-restore backup: `{pre_restore}`")
+        except RuntimeError as exc:
+            result["error"] = str(exc)
+            lines.append(f"HOLD: {exc}")
+
+        STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result_path = RESULTS_DIR / "worker-fleet-controller-v1.json"
+        result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(STATUS_MD)
+        print(result_path)
+        return 0 if result["restored"] else 4
 
     candidate_path = Path(args.candidate).resolve() if args.candidate else None
     tasks = load_tasks(candidate_path) if candidate_path else load_tasks()
