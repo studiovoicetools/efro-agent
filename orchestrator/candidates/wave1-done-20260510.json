@@ -1,0 +1,111 @@
+[
+  {
+    "id": "CUSTOMER_ONBOARDING_TEMPLATE_V1",
+    "repo": "efro",
+    "worktree": "customer-onboarding-template-20260510",
+    "status": "done",
+    "allowed_files": [
+      "docs/EFRO_CUSTOMER_ONBOARDING_TEMPLATE_2026-05-10.md"
+    ],
+    "forbidden_files": [
+      ".env",
+      "src",
+      "app",
+      "package.json",
+      "package-lock.json",
+      "next.config.js"
+    ],
+    "required_gates": [
+      "evidence_only",
+      "claims_gate"
+    ],
+    "success_condition": "A first-customer onboarding template exists for controlled pilot intake, customer data collection, forbidden claims, test questions, and GO/HOLD/NO-GO review.",
+    "stop_condition": "Stop if runtime code, pricing page changes, public page changes, paid provider activation, or customer private data is required.",
+    "next_action": "Create a documentation template only. Keep it evidence-gated and pilot-focused.",
+    "completed_at": "2026-05-10T16:50:54+00:00",
+    "last_commit": "10fe5b9",
+    "note": "Customer onboarding template merged to efro main."
+  },
+  {
+    "id": "FIRST_PILOT_EVIDENCE_SHEET_V1",
+    "repo": "efro",
+    "worktree": "first-pilot-evidence-sheet-20260510",
+    "status": "done",
+    "allowed_files": [
+      "docs/EFRO_FIRST_PILOT_EVIDENCE_SHEET_2026-05-10.md"
+    ],
+    "forbidden_files": [
+      ".env",
+      "src",
+      "app",
+      "package.json",
+      "package-lock.json",
+      "next.config.js"
+    ],
+    "required_gates": [
+      "evidence_only",
+      "claims_gate"
+    ],
+    "success_condition": "A repeatable evidence sheet exists for recording first-pilot questions, answer quality, missing data, screenshots, and final GO/HOLD/NO-GO decision.",
+    "stop_condition": "Stop if runtime code, pricing page changes, public page changes, paid provider activation, or customer private data is required.",
+    "next_action": "Create a documentation evidence sheet only. No customer data.",
+    "completed_at": "2026-05-10T16:50:54+00:00",
+    "last_commit": "e352ca7",
+    "note": "First pilot evidence sheet merged to efro main."
+  },
+  {
+    "id": "LANDINGPAGE_REWRITE_PLAN_READONLY_V1",
+    "repo": "efro",
+    "worktree": "landingpage-rewrite-plan-readonly-20260510",
+    "status": "done",
+    "allowed_files": [
+      "docs/EFRO_LANDINGPAGE_REWRITE_PLAN_2026-05-10.md"
+    ],
+    "forbidden_files": [
+      ".env",
+      "src",
+      "app",
+      "package.json",
+      "package-lock.json",
+      "next.config.js"
+    ],
+    "required_gates": [
+      "claims_gate",
+      "evidence_only"
+    ],
+    "success_condition": "A read-only landingpage rewrite plan exists with SAFE/HOLD/NO-GO messaging, section order, CTA direction, and claim boundaries.",
+    "stop_condition": "Stop if public page editing, pricing editing, billing activation, or unsupported claims are required.",
+    "next_action": "Create a read-only plan document only. Do not edit the public landingpage.",
+    "completed_at": "2026-05-10T16:50:54+00:00",
+    "last_commit": "e572942",
+    "note": "Read-only landingpage rewrite plan merged to efro main. No public page edit."
+  },
+  {
+    "id": "SHOPIFY_LIVE_SMOKE_PLAN_V1",
+    "repo": "efro-shopify",
+    "worktree": "shopify-live-smoke-plan-20260510",
+    "status": "done",
+    "allowed_files": [
+      "docs/SHOPIFY_LIVE_SMOKE_PLAN_2026-05-10.md"
+    ],
+    "forbidden_files": [
+      ".env",
+      "server.js",
+      "webhooks.js",
+      "web",
+      "extensions",
+      "package.json",
+      "package-lock.json"
+    ],
+    "required_gates": [
+      "evidence_only",
+      "claims_gate"
+    ],
+    "success_condition": "A Shopify live smoke plan exists for owner-authorized dev-shop testing without secrets, billing claims, or code changes.",
+    "stop_condition": "Stop if credentials, secret values, billing activation, app submission, or runtime code changes are required.",
+    "next_action": "Create a documentation plan only. Do not touch runtime code or credentials.",
+    "completed_at": "2026-05-10T16:50:54+00:00",
+    "last_commit": "ea6a73e",
+    "note": "Shopify live smoke plan merged to efro-shopify main. No runtime or credential change."
+  }
+]
