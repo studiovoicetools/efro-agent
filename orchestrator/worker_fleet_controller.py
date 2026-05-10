@@ -231,6 +231,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--promotion-check", action="store_true", help="Run pre-promotion checks only. No push. No merge. No deploy.")
     parser.add_argument("--execution-check", default="", help="Validate that one task is safe to execute. No worker is run.")
     parser.add_argument("--diff-check", default="", help="Validate changed files for one task after worker run. No commit.")
+    parser.add_argument("--commit-check", default="", help="Validate that one task is safe to commit. No commit is created.")
     return parser.parse_args()
 
 
@@ -238,8 +239,8 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
 
-    if args.execution_check or args.diff_check:
-        task_id = args.execution_check or args.diff_check
+    if args.execution_check or args.diff_check or args.commit_check:
+        task_id = args.execution_check or args.diff_check or args.commit_check
         candidate_path = Path(args.candidate).resolve() if args.candidate else None
         tasks = load_tasks(candidate_path) if candidate_path else load_tasks()
         task = task_by_id(tasks, task_id)
@@ -263,8 +264,18 @@ def main() -> int:
             blockers.append(f"task not found: {task_id}")
         elif args.execution_check:
             _ok, blockers, warnings = execution_preflight(task, tasks)
+        elif args.diff_check:
+            _ok, blockers, warnings = diff_preflight(task)
         else:
             _ok, blockers, warnings = diff_preflight(task)
+            if not blockers:
+                if os.environ.get("EFRO_FLEET_OWNER_APPROVED_COMMIT") != "true":
+                    blockers.append("commit blocked: EFRO_FLEET_OWNER_APPROVED_COMMIT must be true")
+                required = as_list(task.get("required_gates"))
+                if not required:
+                    blockers.append("commit blocked: required_gates missing")
+                if str(task.get("status", "")).lower() not in {"ready", "preflight", "review"}:
+                    blockers.append(f"commit blocked: task status is not committable: {task.get('status')}")
 
         if blockers:
             for item in blockers:
@@ -278,6 +289,7 @@ def main() -> int:
         result = {
             "generated_at": now(),
             "mode": "worker-execution-guard",
+            "check_type": "execution" if args.execution_check else ("diff" if args.diff_check else "commit"),
             "task_id": task_id,
             "ok": not blockers,
             "blockers": blockers,
@@ -290,6 +302,8 @@ def main() -> int:
 
         print(STATUS_MD)
         print(result_path)
+        if args.commit_check and blockers:
+            return 7
         return 0 if not blockers else 6
 
     if args.promotion_check:
