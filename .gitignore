@@ -12,3 +12,9 @@ __pycache__/
 *.sqlite3
 elevenlabs-agent-*.json
 elevenlabs-agents-list.json
+
+# EFRO runtime generated artifacts
+orchestrator/*_STATUS.md
+orchestrator/worker-results/
+orchestrator/*.bak*
+orchestrator/tasks.json.bak-*
