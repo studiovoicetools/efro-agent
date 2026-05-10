@@ -121,10 +121,15 @@ def main() -> int:
         elif not can_apply:
             lines.append("HOLD: apply preconditions not met.")
         else:
-            backup = write_tasks_with_backup(tasks)
-            result["applied"] = True
-            result["backup"] = str(backup)
-            lines.append(f"Applied candidate tasks with backup: `{backup}`")
+            try:
+                backup = write_tasks_with_backup(tasks)
+                result["applied"] = True
+                result["backup"] = str(backup)
+                lines.append(f"Applied candidate tasks with backup: `{backup}`")
+            except RuntimeError as exc:
+                result["applied"] = False
+                result["apply_error"] = str(exc)
+                lines.append(f"HOLD: {exc}")
 
     STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
