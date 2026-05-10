@@ -1,0 +1,24 @@
+[
+  {
+    "id": "TEST_SAFE_DOC_TASK",
+    "repo": "efro",
+    "worktree": "test-safe-doc-task-20260510",
+    "status": "ready",
+    "allowed_files": [
+      "docs/TEST_SAFE_DOC_TASK.md"
+    ],
+    "forbidden_files": [
+      "src",
+      ".env",
+      "package.json",
+      "package-lock.json"
+    ],
+    "required_gates": [
+      "evidence_only",
+      "claims_gate"
+    ],
+    "success_condition": "A harmless documentation task validates in dry-run mode.",
+    "stop_condition": "Stop if runtime code, secrets, publish, or deploy are required.",
+    "next_action": "Validate only. Do not execute."
+  }
+]

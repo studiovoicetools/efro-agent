@@ -1,0 +1,40 @@
+[
+  {
+    "id": "TEST_OVERLAP_A",
+    "repo": "efro",
+    "worktree": "test-overlap-a-20260510",
+    "status": "ready",
+    "allowed_files": [
+      "docs"
+    ],
+    "forbidden_files": [
+      ".env",
+      "src"
+    ],
+    "required_gates": [
+      "claims_gate"
+    ],
+    "success_condition": "This task overlaps with B.",
+    "stop_condition": "Overlap must HOLD.",
+    "next_action": "Validate only."
+  },
+  {
+    "id": "TEST_OVERLAP_B",
+    "repo": "efro",
+    "worktree": "test-overlap-b-20260510",
+    "status": "ready",
+    "allowed_files": [
+      "docs/TEST.md"
+    ],
+    "forbidden_files": [
+      ".env",
+      "src"
+    ],
+    "required_gates": [
+      "claims_gate"
+    ],
+    "success_condition": "This task overlaps with A.",
+    "stop_condition": "Overlap must HOLD.",
+    "next_action": "Validate only."
+  }
+]

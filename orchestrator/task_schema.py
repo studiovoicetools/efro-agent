@@ -121,15 +121,27 @@ def validate_task(task: dict[str, Any]) -> TaskValidationResult:
             if overlaps(allowed, forbidden):
                 blockers.append(f"allowed/forbidden overlap: {allowed} <-> {forbidden}")
 
-    combined_text = " ".join(
-        str(v).lower()
-        for v in task.values()
-        if not isinstance(v, (list, dict))
-    )
+    owner_only_action_fields = [
+        "goal",
+        "description",
+        "next_action",
+        "task_type",
+    ]
+    owner_only_guard_fields = [
+        "stop_condition",
+        "note",
+    ]
+    actionable_text = " ".join(str(task.get(field, "")).lower() for field in owner_only_action_fields)
+    guard_text = " ".join(str(task.get(field, "")).lower() for field in owner_only_guard_fields)
+    actionable_owner_only = any(word in actionable_text for word in OWNER_ONLY_WORDS)
+    guard_owner_only = any(word in guard_text for word in OWNER_ONLY_WORDS)
 
-    if status != "done" and any(word in combined_text for word in OWNER_ONLY_WORDS):
+    if status != "done" and actionable_owner_only:
         if task.get("owner_approved_execution") is not True:
-            blockers.append("owner-only action referenced without owner_approved_execution=true")
+            blockers.append("owner-only action requested without owner_approved_execution=true")
+
+    if status != "done" and guard_owner_only and not actionable_owner_only:
+        warnings.append("owner-only action mentioned only as guard/stop condition")
 
     return TaskValidationResult(ok=not blockers, blockers=blockers, warnings=warnings)
 

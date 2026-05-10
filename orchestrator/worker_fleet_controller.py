@@ -64,6 +64,12 @@ def main() -> int:
     tasks = load_tasks(candidate_path) if candidate_path else load_tasks()
     validations = validate_tasks(tasks)
     overlaps = find_overlaps(tasks)
+    overlap_task_ids: set[str] = set()
+    for item in overlaps:
+        parts = item.split()
+        if len(parts) >= 3 and parts[1] == "overlaps":
+            overlap_task_ids.add(parts[0])
+            overlap_task_ids.add(parts[2])
 
     can_apply = args.apply and candidate_path is not None and not overlaps and all(v.ok for v in validations.values())
     mode = "candidate-apply" if args.apply else "dry-run"
@@ -93,8 +99,11 @@ def main() -> int:
     }
 
     for task_id, validation in validations.items():
-        label = status_label(validation.ok, validation.blockers)
-        blockers = "<br>".join(validation.blockers) if validation.blockers else ""
+        task_blockers = list(validation.blockers)
+        if task_id in overlap_task_ids:
+            task_blockers.append("active file ownership overlap detected")
+        label = status_label(validation.ok and not task_blockers, task_blockers)
+        blockers = "<br>".join(task_blockers) if task_blockers else ""
         warnings = "<br>".join(validation.warnings) if validation.warnings else ""
         lines.append(f"| {task_id} | {label} | {blockers} | {warnings} |")
         result["tasks"][task_id] = {

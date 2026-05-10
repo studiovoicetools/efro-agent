@@ -1,0 +1,20 @@
+[
+  {
+    "id": "TEST_UNSAFE_ENV_TASK",
+    "repo": "efro",
+    "worktree": "test-unsafe-env-20260510",
+    "status": "ready",
+    "allowed_files": [
+      ".env"
+    ],
+    "forbidden_files": [
+      "src"
+    ],
+    "required_gates": [
+      "claims_gate"
+    ],
+    "success_condition": "This must not pass.",
+    "stop_condition": "Unsafe env path must be blocked.",
+    "next_action": "Validate only."
+  }
+]
