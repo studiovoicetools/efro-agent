@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -223,6 +224,87 @@ def diff_preflight(task: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
     return not blockers, blockers, warnings
 
 
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_self_test() -> tuple[bool, list[str]]:
+    failures: list[str] = []
+    candidates = SOURCE_ROOT / "orchestrator/test-candidates"
+
+    valid_path = candidates / "valid-single-task.json"
+    invalid_path = candidates / "invalid-unsafe-env.json"
+    overlap_path = candidates / "overlap-tasks.json"
+
+    for path in [valid_path, invalid_path, overlap_path]:
+        if not path.exists():
+            failures.append(f"missing test candidate: {path}")
+
+    if failures:
+        return False, failures
+
+    before = sha256_file(TASKS_JSON)
+
+    saved_env = {
+        "EFRO_FLEET_ENABLE_QUEUE_WRITE": os.environ.get("EFRO_FLEET_ENABLE_QUEUE_WRITE"),
+        "EFRO_FLEET_OWNER_APPROVED": os.environ.get("EFRO_FLEET_OWNER_APPROVED"),
+        "EFRO_FLEET_OWNER_APPROVED_PUSH": os.environ.get("EFRO_FLEET_OWNER_APPROVED_PUSH"),
+    }
+
+    for key in saved_env:
+        os.environ.pop(key, None)
+
+    try:
+        valid_tasks = load_tasks(valid_path)
+        invalid_tasks = load_tasks(invalid_path)
+        overlap_tasks = load_tasks(overlap_path)
+
+        valid_result = validate_tasks(valid_tasks)
+        if not all(item.ok for item in valid_result.values()):
+            failures.append("valid candidate did not validate")
+
+        invalid_result = validate_tasks(invalid_tasks)
+        if all(item.ok for item in invalid_result.values()):
+            failures.append("invalid env candidate unexpectedly validated")
+
+        overlap_result = find_overlaps(overlap_tasks)
+        if not overlap_result:
+            failures.append("overlap candidate did not produce overlap HOLD")
+
+        try:
+            write_tasks_with_backup(valid_tasks)
+            failures.append("write_tasks_with_backup unexpectedly wrote without env approval")
+        except RuntimeError:
+            pass
+
+        try:
+            restore_queue_from_backup(TASKS_JSON.with_suffix(".json.bak-fleet-NOTREAL"))
+            failures.append("restore_queue_from_backup unexpectedly restored without env approval")
+        except RuntimeError:
+            pass
+
+        execution_ok, execution_blockers, _warnings = execution_preflight(valid_tasks[0], valid_tasks)
+        if execution_ok or not any("worktree missing" in item for item in execution_blockers):
+            failures.append("execution preflight did not block missing test worktree")
+
+        promotion_ok, promotion_blockers, _warnings = promotion_preflight()
+        if promotion_ok or not any("EFRO_FLEET_OWNER_APPROVED_PUSH" in item for item in promotion_blockers):
+            failures.append("promotion preflight did not block missing push approval")
+
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    after = sha256_file(TASKS_JSON)
+    if before != after:
+        failures.append("runtime tasks.json checksum changed during self-test")
+
+    return not failures, failures
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EFRO Worker Fleet Controller V1")
     parser.add_argument("--candidate", default="", help="Optional candidate tasks JSON file to validate.")
@@ -232,12 +314,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execution-check", default="", help="Validate that one task is safe to execute. No worker is run.")
     parser.add_argument("--diff-check", default="", help="Validate changed files for one task after worker run. No commit.")
     parser.add_argument("--commit-check", default="", help="Validate that one task is safe to commit. No commit is created.")
+    parser.add_argument("--self-test", action="store_true", help="Run controller safety regression tests. No queue mutation.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.self_test:
+        ok, failures = run_self_test()
+        lines = [
+            "# EFRO Worker Fleet Controller Status",
+            "",
+            f"Generated: {now()}",
+            "",
+            "Mode: V1 self-test. No queue mutation. No push. No deploy.",
+            "",
+            "| Test | Status | Detail |",
+            "|---|---|---|",
+        ]
+
+        if failures:
+            for failure in failures:
+                lines.append(f"| Self-test | HOLD | {failure} |")
+        else:
+            lines.append("| Self-test | GO | all controller safety regressions passed |")
+
+        result = {
+            "generated_at": now(),
+            "mode": "self-test",
+            "ok": ok,
+            "failures": failures,
+        }
+
+        STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result_path = RESULTS_DIR / "worker-fleet-controller-v1.json"
+        result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        print(STATUS_MD)
+        print(result_path)
+        return 0 if ok else 8
 
     if args.execution_check or args.diff_check or args.commit_check:
         task_id = args.execution_check or args.diff_check or args.commit_check
