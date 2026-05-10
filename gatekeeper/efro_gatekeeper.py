@@ -10,6 +10,13 @@ OUT = Path("/opt/efro-agent/gatekeeper/EFRO_AUTOPILOT_STATUS.md")
 
 TARGETS = [
     {
+        "area": "Worker Fleet Controller",
+        "path": Path("/opt/efro-agent-worker-fleet-controller-20260510"),
+        "expected": "",
+        "missing": "HOLD",
+        "note": "Fleet validation, queue apply guard, and regression candidates.",
+    },
+    {
         "area": "Brain gates",
         "path": ROOT / "efro-brain-brain-answer-quality-gates-20260508",
         "expected": "83f8a10",
