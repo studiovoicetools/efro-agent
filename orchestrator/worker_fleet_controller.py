@@ -224,6 +224,26 @@ def diff_preflight(task: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
     return not blockers, blockers, warnings
 
 
+def auto_safe_preflight(task: dict[str, Any], all_tasks: list[dict[str, Any]]) -> tuple[bool, list[str], list[str]]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+    _ok, bs, ws = execution_preflight(task, all_tasks)
+    blockers += bs
+    warnings += ws
+    repo = str(task.get("repo", ""))
+    allowed = as_list(task.get("allowed_files"))
+    if repo not in {"efro", "efro-widget", "efro-shopify", "efro-brain"}:
+        blockers.append(f"auto-safe blocked: repo not eligible: {repo}")
+    if len(allowed) != 1:
+        blockers.append("auto-safe blocked: exactly one allowed file required")
+    risky = [".env", "src/app/api", "api", "server.js", "package.json", "package-lock.json"]
+    for item in allowed:
+        if path_matches(item, risky):
+            blockers.append(f"auto-safe blocked: risky path: {item}")
+    warnings.append("auto-safe check only: no files changed")
+    return not blockers, blockers, warnings
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -305,6 +325,26 @@ def run_self_test() -> tuple[bool, list[str]]:
     return not failures, failures
 
 
+def auto_safe_cli(args: argparse.Namespace) -> int:
+    tid = args.auto_safe_check
+    tasks = load_tasks(Path(args.candidate).resolve()) if args.candidate else load_tasks()
+    task = task_by_id(tasks, tid)
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if task:
+        _ok, blockers, warnings = auto_safe_preflight(task, tasks)
+    else:
+        blockers.append(f"task not found: {tid}")
+    lines = ["# EFRO Worker Fleet Controller Status", "", f"Generated: {now()}", "", "Mode: V1 auto-safe-check. No file changes. No push. No deploy.", "", "| Check | Status | Detail |", "|---|---|---|"]
+    lines += [f"| Auto-safe | HOLD | {x} |" for x in blockers]
+    if not blockers:
+        lines.append("| Auto-safe | GO | task is eligible for safe autonomous lane classification |")
+    lines += [f"| Warning | REVIEW | {x} |" for x in warnings]
+    STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(STATUS_MD)
+    return 0 if not blockers else 9
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EFRO Worker Fleet Controller V1")
     parser.add_argument("--candidate", default="", help="Optional candidate tasks JSON file to validate.")
@@ -315,12 +355,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diff-check", default="", help="Validate changed files for one task after worker run. No commit.")
     parser.add_argument("--commit-check", default="", help="Validate that one task is safe to commit. No commit is created.")
     parser.add_argument("--self-test", action="store_true", help="Run controller safety regression tests. No queue mutation.")
+    parser.add_argument("--auto-safe-check", default="", help="Classify whether one task is eligible for safe autonomous execution. No file changes.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.auto_safe_check:
+        return auto_safe_cli(args)
 
     if args.self_test:
         ok, failures = run_self_test()
