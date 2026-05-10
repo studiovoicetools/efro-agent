@@ -18,3 +18,7 @@ orchestrator/*_STATUS.md
 orchestrator/worker-results/
 orchestrator/*.bak*
 orchestrator/tasks.json.bak-*
+
+# EFRO runtime local state
+gatekeeper/*_STATUS.md
+orchestrator/tasks.json
