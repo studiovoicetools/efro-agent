@@ -347,6 +347,45 @@ def run_self_test() -> tuple[bool, list[str]]:
     return not failures, failures
 
 
+def apply_safe_patch_plan(plan: dict[str, Any], tasks: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    _ok, blockers, warnings = safe_patch_plan_preflight(plan, tasks)
+    if blockers:
+        return blockers, warnings
+    task = task_by_id(tasks, str(plan.get("task_id", "")))
+    assert task is not None
+    target = task_worktree_path(task) / str(plan.get("file", ""))
+    text = target.read_text(encoding="utf-8")
+    for item in plan.get("replacements", []):
+        old = str(item.get("old", ""))
+        new = str(item.get("new", ""))
+        if old not in text:
+            blockers.append(f"safe patch run blocked: old text not found: {old[:80]}")
+        else:
+            text = text.replace(old, new, 1)
+    if blockers:
+        return blockers, warnings
+    target.write_text(text, encoding="utf-8")
+    _ok, bs, ws = diff_preflight(task)
+    blockers += bs
+    warnings += ws
+    warnings.append("safe patch run applied locally only: no commit, no push, no deploy")
+    return blockers, warnings
+
+
+def safe_patch_run_cli(args: argparse.Namespace) -> int:
+    plan = json.loads(Path(args.safe_patch_run).read_text(encoding="utf-8"))
+    tasks = load_tasks(Path(args.candidate).resolve()) if args.candidate else load_tasks()
+    blockers, warnings = apply_safe_patch_plan(plan, tasks)
+    lines = ["# EFRO Worker Fleet Controller Status", "", f"Generated: {now()}", "", "Mode: V1 safe-patch-run. No commit. No push. No deploy.", "", "| Check | Status | Detail |", "|---|---|---|"]
+    lines += [f"| Safe patch run | HOLD | {x} |" for x in blockers]
+    if not blockers:
+        lines.append("| Safe patch run | GO | patch applied inside task worktree; review diff before commit |")
+    lines += [f"| Warning | REVIEW | {x} |" for x in warnings]
+    STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(STATUS_MD)
+    return 0 if not blockers else 11
+
+
 def safe_patch_plan_cli(args: argparse.Namespace) -> int:
     plan = json.loads(Path(args.safe_patch_plan).read_text(encoding="utf-8"))
     tasks = load_tasks(Path(args.candidate).resolve()) if args.candidate else load_tasks()
@@ -393,12 +432,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test", action="store_true", help="Run controller safety regression tests. No queue mutation.")
     parser.add_argument("--auto-safe-check", default="", help="Classify whether one task is eligible for safe autonomous execution. No file changes.")
     parser.add_argument("--safe-patch-plan", default="", help="Validate a safe patch plan JSON. No file changes.")
+    parser.add_argument("--safe-patch-run", default="", help="Apply a validated safe patch plan inside the task worktree. No push. No deploy.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.safe_patch_run:
+        return safe_patch_run_cli(args)
 
     if args.safe_patch_plan:
         return safe_patch_plan_cli(args)
