@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from task_locks import find_overlaps
-from task_schema import validate_tasks
+from task_schema import as_list, validate_task, validate_tasks
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_ROOT = Path(os.environ.get("EFRO_FLEET_RUNTIME_ROOT", "/opt/efro-agent"))
@@ -128,18 +128,169 @@ def promotion_preflight() -> tuple[bool, list[str], list[str]]:
     return not blockers, blockers, warnings
 
 
+def task_by_id(tasks: list[dict[str, Any]], task_id: str) -> dict[str, Any] | None:
+    for task in tasks:
+        if str(task.get("id", "")) == task_id:
+            return task
+    return None
+
+
+def task_worktree_path(task: dict[str, Any]) -> Path:
+    repo = str(task.get("repo", ""))
+    worktree = str(task.get("worktree", ""))
+    return RUNTIME_ROOT / "repos" / f"{repo}-{worktree}"
+
+
+def path_matches(path: str, patterns: list[str]) -> bool:
+    clean = path.replace("\\", "/").rstrip("/")
+    for pattern in patterns:
+        p = str(pattern).replace("\\", "/").rstrip("/")
+        if clean == p or clean.startswith(p + "/"):
+            return True
+    return False
+
+
+def changed_files(path: Path) -> tuple[bool, list[str], str]:
+    if not path.exists():
+        return False, [], f"worktree missing: {path}"
+
+    outputs: list[str] = []
+    for cmd in [
+        ["git", "diff", "--name-only"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ]:
+        rc, out = run_cmd(cmd, path)
+        if rc != 0:
+            return False, [], out
+        outputs.extend([line.strip() for line in out.splitlines() if line.strip()])
+
+    return True, sorted(set(outputs)), ""
+
+
+def execution_preflight(task: dict[str, Any], all_tasks: list[dict[str, Any]]) -> tuple[bool, list[str], list[str]]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    validation = validate_task(task)
+    blockers.extend(validation.blockers)
+    warnings.extend(validation.warnings)
+
+    status = str(task.get("status", "")).lower()
+    if status not in {"ready", "preflight", "review"}:
+        blockers.append(f"task status is not executable: {status}")
+
+    overlaps = find_overlaps(all_tasks)
+    task_id = str(task.get("id", ""))
+    for item in overlaps:
+        parts = item.split()
+        if len(parts) >= 3 and task_id in {parts[0], parts[2]}:
+            blockers.append(f"active overlap blocks execution: {item}")
+
+    wt = task_worktree_path(task)
+    if not wt.exists():
+        blockers.append(f"worktree missing: {wt}")
+    else:
+        is_clean, detail = git_clean(wt)
+        if not is_clean:
+            blockers.append(f"task worktree dirty before execution: {detail or 'dirty'}")
+
+    return not blockers, blockers, warnings
+
+
+def diff_preflight(task: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    wt = task_worktree_path(task)
+    ok, files, err = changed_files(wt)
+    if not ok:
+        blockers.append(err)
+        return False, blockers, warnings
+
+    allowed = as_list(task.get("allowed_files"))
+    forbidden = as_list(task.get("forbidden_files"))
+
+    if not files:
+        warnings.append("no changed files detected")
+
+    for file_path in files:
+        if not path_matches(file_path, allowed):
+            blockers.append(f"changed file outside allowed_files: {file_path}")
+        if path_matches(file_path, forbidden):
+            blockers.append(f"changed file matches forbidden_files: {file_path}")
+
+    return not blockers, blockers, warnings
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EFRO Worker Fleet Controller V1")
     parser.add_argument("--candidate", default="", help="Optional candidate tasks JSON file to validate.")
     parser.add_argument("--apply", action="store_true", help="Apply candidate tasks only with explicit environment approval.")
     parser.add_argument("--restore-backup", default="", help="Restore runtime queue from a fleet-created backup with explicit environment approval.")
     parser.add_argument("--promotion-check", action="store_true", help="Run pre-promotion checks only. No push. No merge. No deploy.")
+    parser.add_argument("--execution-check", default="", help="Validate that one task is safe to execute. No worker is run.")
+    parser.add_argument("--diff-check", default="", help="Validate changed files for one task after worker run. No commit.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.execution_check or args.diff_check:
+        task_id = args.execution_check or args.diff_check
+        candidate_path = Path(args.candidate).resolve() if args.candidate else None
+        tasks = load_tasks(candidate_path) if candidate_path else load_tasks()
+        task = task_by_id(tasks, task_id)
+
+        lines = [
+            "# EFRO Worker Fleet Controller Status",
+            "",
+            f"Generated: {now()}",
+            "",
+            "Mode: V1 worker-execution-guard. No worker run. No commit. No push.",
+            f"Task source: `{candidate_path if candidate_path else TASKS_JSON}`",
+            "",
+            "| Check | Status | Detail |",
+            "|---|---|---|",
+        ]
+
+        blockers: list[str] = []
+        warnings: list[str] = []
+
+        if not task:
+            blockers.append(f"task not found: {task_id}")
+        elif args.execution_check:
+            _ok, blockers, warnings = execution_preflight(task, tasks)
+        else:
+            _ok, blockers, warnings = diff_preflight(task)
+
+        if blockers:
+            for item in blockers:
+                lines.append(f"| Execution | HOLD | {item} |")
+        else:
+            lines.append("| Execution | GO | guard checks passed |")
+
+        for item in warnings:
+            lines.append(f"| Warning | REVIEW | {item} |")
+
+        result = {
+            "generated_at": now(),
+            "mode": "worker-execution-guard",
+            "task_id": task_id,
+            "ok": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+        }
+
+        STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result_path = RESULTS_DIR / "worker-fleet-controller-v1.json"
+        result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        print(STATUS_MD)
+        print(result_path)
+        return 0 if not blockers else 6
 
     if args.promotion_check:
         ok, blockers, warnings = promotion_preflight()
