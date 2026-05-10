@@ -244,6 +244,28 @@ def auto_safe_preflight(task: dict[str, Any], all_tasks: list[dict[str, Any]]) -
     return not blockers, blockers, warnings
 
 
+def safe_patch_plan_preflight(plan: dict[str, Any], tasks: list[dict[str, Any]]) -> tuple[bool, list[str], list[str]]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+    task = task_by_id(tasks, str(plan.get("task_id", "")))
+    file_path = str(plan.get("file", ""))
+    reps = plan.get("replacements", [])
+    if not task:
+        blockers.append("safe patch plan blocked: task not found")
+    else:
+        _ok, bs, ws = auto_safe_preflight(task, tasks)
+        blockers += bs
+        warnings += ws
+        if not path_matches(file_path, as_list(task.get("allowed_files"))):
+            blockers.append(f"safe patch plan blocked: file outside allowed_files: {file_path}")
+    if not isinstance(reps, list) or not reps:
+        blockers.append("safe patch plan blocked: replacements missing")
+    if isinstance(reps, list) and len(reps) > 12:
+        blockers.append("safe patch plan blocked: too many replacements")
+    warnings.append("safe patch plan check only: no files changed")
+    return not blockers, blockers, warnings
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -325,6 +347,20 @@ def run_self_test() -> tuple[bool, list[str]]:
     return not failures, failures
 
 
+def safe_patch_plan_cli(args: argparse.Namespace) -> int:
+    plan = json.loads(Path(args.safe_patch_plan).read_text(encoding="utf-8"))
+    tasks = load_tasks(Path(args.candidate).resolve()) if args.candidate else load_tasks()
+    _ok, blockers, warnings = safe_patch_plan_preflight(plan, tasks)
+    lines = ["# EFRO Worker Fleet Controller Status", "", f"Generated: {now()}", "", "Mode: V1 safe-patch-plan. No file changes. No push. No deploy.", "", "| Check | Status | Detail |", "|---|---|---|"]
+    lines += [f"| Safe patch plan | HOLD | {x} |" for x in blockers]
+    if not blockers:
+        lines.append("| Safe patch plan | GO | plan is valid for safe runner lane |")
+    lines += [f"| Warning | REVIEW | {x} |" for x in warnings]
+    STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(STATUS_MD)
+    return 0 if not blockers else 10
+
+
 def auto_safe_cli(args: argparse.Namespace) -> int:
     tid = args.auto_safe_check
     tasks = load_tasks(Path(args.candidate).resolve()) if args.candidate else load_tasks()
@@ -356,12 +392,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--commit-check", default="", help="Validate that one task is safe to commit. No commit is created.")
     parser.add_argument("--self-test", action="store_true", help="Run controller safety regression tests. No queue mutation.")
     parser.add_argument("--auto-safe-check", default="", help="Classify whether one task is eligible for safe autonomous execution. No file changes.")
+    parser.add_argument("--safe-patch-plan", default="", help="Validate a safe patch plan JSON. No file changes.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.safe_patch_plan:
+        return safe_patch_plan_cli(args)
 
     if args.auto_safe_check:
         return auto_safe_cli(args)
