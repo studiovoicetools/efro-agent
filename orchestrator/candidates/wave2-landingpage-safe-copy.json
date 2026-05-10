@@ -1,0 +1,30 @@
+[
+  {
+    "id": "LANDINGPAGE_HERO_SAFE_COPY_V1",
+    "repo": "efro",
+    "worktree": "landingpage-hero-safe-copy-20260510",
+    "status": "ready",
+    "allowed_files": [
+      "src/app/page.tsx"
+    ],
+    "forbidden_files": [
+      ".env",
+      "src/app/api",
+      "src/app/admin",
+      "src/app/demo",
+      "package.json",
+      "package-lock.json",
+      "next.config.js",
+      "tailwind.config.js",
+      "public",
+      "tests"
+    ],
+    "required_gates": [
+      "typescript",
+      "claims_gate"
+    ],
+    "success_condition": "Landingpage hero copy is made more sales-focused and pilot-safe without changing pricing, billing, APIs, admin pages, demos, package files, or deployment behavior.",
+    "stop_condition": "Stop if broader redesign, pricing edits, billing claims, Shopify approval claims, new components, package changes, API changes, or deploy are required.",
+    "next_action": "Prepare a minimal patch for src/app/page.tsx only: hero headline, subheadline, trust pills, and CTA wording. Do not edit pricing or runtime behavior."
+  }
+]
