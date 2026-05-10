@@ -212,6 +212,8 @@ def main() -> int:
         return 2
     if any(not v.ok for v in validations.values()):
         return 3
+    if args.apply and not result.get("applied"):
+        return 4
     return 0
 
 
