@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -71,17 +72,113 @@ def status_label(ok: bool, blockers: list[str]) -> str:
     return "REVIEW"
 
 
+def run_cmd(cmd: list[str], cwd: Path, timeout: int = 60) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        return proc.returncode, (proc.stdout or "").strip()
+    except Exception as exc:
+        return 1, f"ERROR: {exc}"
+
+
+def git_clean(path: Path) -> tuple[bool, str]:
+    rc, out = run_cmd(["git", "status", "--porcelain"], path)
+    if rc != 0:
+        return False, out
+    return out == "", out
+
+
+def promotion_preflight() -> tuple[bool, list[str], list[str]]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    source_clean, source_status = git_clean(SOURCE_ROOT)
+    if not source_clean:
+        blockers.append(f"source worktree is dirty: {source_status or 'dirty'}")
+
+    runtime_clean, runtime_status = git_clean(RUNTIME_ROOT)
+    if not runtime_clean:
+        blockers.append(f"runtime repo is dirty: {runtime_status or 'dirty'}")
+
+    if os.environ.get("EFRO_FLEET_OWNER_APPROVED_PUSH") != "true":
+        blockers.append("push/promotion blocked: EFRO_FLEET_OWNER_APPROVED_PUSH must be true")
+
+    compile_targets = [
+        "orchestrator/task_schema.py",
+        "orchestrator/task_locks.py",
+        "orchestrator/worker_fleet_controller.py",
+        "gatekeeper/efro_gatekeeper.py",
+    ]
+
+    for rel in compile_targets:
+        target = SOURCE_ROOT / rel
+        if not target.exists():
+            warnings.append(f"compile target missing: {rel}")
+            continue
+        rc, out = run_cmd(["python3", "-m", "py_compile", str(target)], SOURCE_ROOT)
+        if rc != 0:
+            blockers.append(f"compile failed for {rel}: {out}")
+
+    return not blockers, blockers, warnings
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EFRO Worker Fleet Controller V1")
     parser.add_argument("--candidate", default="", help="Optional candidate tasks JSON file to validate.")
     parser.add_argument("--apply", action="store_true", help="Apply candidate tasks only with explicit environment approval.")
     parser.add_argument("--restore-backup", default="", help="Restore runtime queue from a fleet-created backup with explicit environment approval.")
+    parser.add_argument("--promotion-check", action="store_true", help="Run pre-promotion checks only. No push. No merge. No deploy.")
     return parser.parse_args()
 
 
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     args = parse_args()
+
+    if args.promotion_check:
+        ok, blockers, warnings = promotion_preflight()
+        lines = [
+            "# EFRO Worker Fleet Controller Status",
+            "",
+            f"Generated: {now()}",
+            "",
+            "Mode: V1 promotion-check. No push. No merge. No deploy.",
+            "",
+            "| Check | Status | Detail |",
+            "|---|---|---|",
+        ]
+
+        if blockers:
+            for item in blockers:
+                lines.append(f"| Promotion | HOLD | {item} |")
+        else:
+            lines.append("| Promotion | GO | all required promotion checks passed |")
+
+        if warnings:
+            for item in warnings:
+                lines.append(f"| Warning | REVIEW | {item} |")
+
+        result = {
+            "generated_at": now(),
+            "mode": "promotion-check",
+            "ok": ok,
+            "blockers": blockers,
+            "warnings": warnings,
+        }
+
+        STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result_path = RESULTS_DIR / "worker-fleet-controller-v1.json"
+        result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        print(STATUS_MD)
+        print(result_path)
+        return 0 if ok else 5
 
     if args.restore_backup:
         restore_source = Path(args.restore_backup).resolve()
