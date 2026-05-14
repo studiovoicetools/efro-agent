@@ -98,7 +98,8 @@ def main() -> int:
             continue
 
         if approved:
-            rc, out = run(["git", "worktree", "remove", str(path)], REPOS_ROOT / "efro", 60)
+            repo_base = REPOS_ROOT / str(row.get("repo", ""))
+            rc, out = run(["git", "worktree", "remove", str(path)], repo_base, 60)
             item["output"] = out
             if rc == 0:
                 item["removed"] = True
