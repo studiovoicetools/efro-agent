@@ -106,6 +106,11 @@ def validate_task(task: dict[str, Any]) -> TaskValidationResult:
     if not required_gates:
         blockers.append("required_gates must not be empty")
 
+    if status == "done":
+        for field_name in ["evidence_checked", "memory_updated", "read_first_ack"]:
+            if task.get(field_name) is not True:
+                warnings.append(f"done task missing {field_name}=true")
+
     for rel in allowed_files:
         if not safe_rel_path(rel):
             blockers.append(f"unsafe allowed path: {rel}")
