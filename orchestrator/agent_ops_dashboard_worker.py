@@ -14,6 +14,7 @@ HYGIENE_MD = ORCH / "WORKTREE_HYGIENE_STATUS.md"
 HOLD_MD = ORCH / "HOLD_DIRTY_TRIAGE_STATUS.md"
 PROPOSAL_MD = ORCH / "CLEANUP_PROPOSAL_STATUS.md"
 DRY_RUN_MD = ORCH / "CLEANUP_DRY_RUN_STATUS.md"
+REVIEW_PROOF_JSON = RESULTS / "review-proof-v1.json"
 
 OUT_MD = ORCH / "AGENT_OPS_DASHBOARD_STATUS.md"
 OUT_JSON = RESULTS / "agent-ops-dashboard-v1.json"
@@ -25,6 +26,17 @@ def now() -> str:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def read_json(path: Path) -> dict:
+    text = read_text(path)
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def first_match(pattern: str, text: str, default: str = "") -> str:
@@ -77,9 +89,11 @@ def main() -> int:
     hold = read_text(HOLD_MD)
     proposal = read_text(PROPOSAL_MD)
     dry_run = read_text(DRY_RUN_MD)
+    review_proof = read_json(REVIEW_PROOF_JSON)
 
     counts = parse_status_counts(hygiene)
     top_hold_dirty = parse_top_hold_dirty(hold)
+    review_counts = review_proof.get("counts", {}) if isinstance(review_proof.get("counts", {}), dict) else {}
 
     payload = {
         "generated": now(),
@@ -89,6 +103,7 @@ def main() -> int:
             "hold_dirty_triage": generated_at(hold),
             "cleanup_proposal": generated_at(proposal),
             "cleanup_dry_run": generated_at(dry_run),
+            "review_proof": str(review_proof.get("generated", "missing")),
         },
         "status_counts": counts,
         "cleanup": {
@@ -99,6 +114,11 @@ def main() -> int:
             "blocked": parse_int("Blocked", dry_run),
         },
         "top_hold_dirty": top_hold_dirty,
+        "review_proof": {
+            "review_clean_count": int(review_proof.get("review_clean_count", 0) or 0),
+            "proven_count": int(review_proof.get("proven_count", 0) or 0),
+            "counts": review_counts,
+        },
         "boundary": "P2 automatic cleanup is complete; remaining groups are protected owner-review groups.",
     }
 
@@ -120,6 +140,7 @@ def main() -> int:
         f"| HOLD_DIRTY triage | {payload['sources']['hold_dirty_triage']} |",
         f"| Cleanup proposal | {payload['sources']['cleanup_proposal']} |",
         f"| Cleanup dry-run | {payload['sources']['cleanup_dry_run']} |",
+        f"| REVIEW proof | {payload['sources']['review_proof']} |",
         "",
         "## Worktree status counts",
         "",
@@ -130,8 +151,17 @@ def main() -> int:
     for key in sorted(counts):
         lines.append(f"| {key} | {counts[key]} |")
 
+    review = payload["review_proof"]
+    review_counts_out = review["counts"]
     cleanup = payload["cleanup"]
     lines += [
+        "",
+        "## REVIEW proof summary",
+        "",
+        f"- Clean REVIEW items inspected: {review['review_clean_count']}",
+        f"- Proven evidence candidates: {review['proven_count']}",
+        f"- PATCH_EQUIVALENT_TO_MAIN: {review_counts_out.get('PATCH_EQUIVALENT_TO_MAIN', 0)}",
+        f"- CLEAN_BUT_NOT_PROVEN: {review_counts_out.get('CLEAN_BUT_NOT_PROVEN', 0)}",
         "",
         "## Cleanup boundary",
         "",
