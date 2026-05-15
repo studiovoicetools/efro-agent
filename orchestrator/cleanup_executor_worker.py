@@ -13,11 +13,13 @@ DRY_RUN = ROOT / "orchestrator/worker-results/cleanup-dry-run-v1.json"
 OUT_MD = ROOT / "orchestrator/CLEANUP_EXECUTOR_STATUS.md"
 OUT_JSON = ROOT / "orchestrator/worker-results/cleanup-executor-v1.json"
 
-APPROVAL_TOKEN = "I_APPROVE_CLEANUP_BATCH_1_20260509"
 BASE_REPOS = {"efro", "efro-widget", "efro-brain", "efro-shopify"}
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def approval_token() -> str:
+    return f"I_APPROVE_CLEANUP_BATCH_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 30) -> tuple[int, str]:
     try:
@@ -71,7 +73,8 @@ def main() -> int:
         if row.get("safe_for_owner_cleanup") is True
     ]
 
-    approved = os.environ.get("EFRO_CLEANUP_APPROVED") == APPROVAL_TOKEN
+    expected_token = approval_token()
+    approved = os.environ.get("EFRO_CLEANUP_APPROVED") == expected_token
     mode = "EXECUTE_OWNER_APPROVED" if approved else "LOCKED_NO_DELETE"
 
     results = []
@@ -114,6 +117,7 @@ def main() -> int:
         "generated": now(),
         "mode": mode,
         "approved": approved,
+        "expected_approval_token": expected_token,
         "candidate_count": len(candidates),
         "removed_count": removed,
         "blocked_count": blocked,
@@ -130,6 +134,7 @@ def main() -> int:
         f"Mode: {mode}",
         "",
         f"Approved: {approved}",
+        f"Expected approval token: {expected_token}",
         f"Candidates: {len(candidates)}",
         f"Removed: {removed}",
         f"Blocked: {blocked}",
