@@ -164,6 +164,18 @@ def main() -> int:
         if item["classification"] in {"PROVEN_MERGED_BY_ANCESTOR", "PATCH_EQUIVALENT_TO_MAIN"}
     ]
 
+    owner_removal_candidates = [
+        {
+            "name": i.get("name", ""),
+            "repo": i.get("repo", ""),
+            "branch": i.get("branch", ""),
+            "path": i.get("path", ""),
+            "classification": i.get("classification", ""),
+            "proof": i.get("proof", ""),
+        }
+        for i in proven
+    ]
+
     payload = {
         "generated": now(),
         "mode": "read_only_review_proof",
@@ -171,6 +183,8 @@ def main() -> int:
         "review_clean_count": len(rows),
         "counts": counts,
         "proven_count": len(proven),
+        "owner_removal_candidate_count": len(owner_removal_candidates),
+        "owner_removal_candidates": owner_removal_candidates,
         "items": items,
     }
 
@@ -211,6 +225,21 @@ def main() -> int:
             f"| {i} | {item['name']} | {item['repo']} | {item['branch']} | "
             f"{item['classification']} | {item['proof']} |"
         )
+
+    lines += [
+        "",
+        "## Owner-removal candidates",
+        "",
+        f"Owner-removal evidence candidates: {len(owner_removal_candidates)}",
+        "These are proposed worktree removals only after explicit owner approval.",
+        "Use repo-explicit local commands only.",
+        "",
+        "| # | Name | Repo | Path |",
+        "|---:|---|---|---|",
+    ]
+
+    for i, item in enumerate(owner_removal_candidates[:80], 1):
+        lines.append(f"| {i} | {item['name']} | {item['repo']} | {item['path']} |")
 
     lines += [
         "",
