@@ -86,6 +86,11 @@ def inspect(row: dict) -> dict:
         "topic": topic,
         "topic_rank": rank,
         "blockers": [],
+        "archive_commands": {
+            "status": f"git -C {row.get('path', '')} status --porcelain",
+            "diff_stat": f"git -C {row.get('path', '')} diff --stat",
+            "diff": f"git -C {row.get('path', '')} diff",
+        },
     }
 
     if path is None:
@@ -169,6 +174,15 @@ def main() -> int:
         lines.append(f"| {i} | {item['name']} | {item['repo']} | {item['branch']} | {item['dirty_count']} | {item['topic']} | {blockers} |")
 
     lines += [
+        "",
+        "## Dirty archive plan",
+        "",
+        "Each HOLD_DIRTY item now includes repo-explicit archive commands in JSON:",
+        "- status: `git -C <worktree> status --porcelain`",
+        "- diff_stat: `git -C <worktree> diff --stat`",
+        "- diff: `git -C <worktree> diff`",
+        "",
+        "Archive first. Delete only after explicit owner approval.",
         "",
         "## Rule",
         "",
