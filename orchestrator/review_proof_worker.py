@@ -239,7 +239,7 @@ def main() -> int:
         "|---:|---|---|---|---|",
     ]
 
-    for i, item in enumerate(owner_removal_candidates[:80], 1):
+    for i, item in enumerate(owner_removal_candidates, 1):
         lines.append(
             f"| {i} | {item['name']} | {item['repo']} | {item['path']} | "
             f"`{item['owner_command']}` |"
