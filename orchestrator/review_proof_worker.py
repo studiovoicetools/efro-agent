@@ -172,6 +172,7 @@ def main() -> int:
             "path": i.get("path", ""),
             "classification": i.get("classification", ""),
             "proof": i.get("proof", ""),
+            "owner_command": f"git -C /opt/efro-agent/repos/{i.get('repo', '')} worktree remove {i.get('path', '')}",
         }
         for i in proven
     ]
@@ -234,12 +235,15 @@ def main() -> int:
         "These are proposed worktree removals only after explicit owner approval.",
         "Use repo-explicit local commands only.",
         "",
-        "| # | Name | Repo | Path |",
-        "|---:|---|---|---|",
+        "| # | Name | Repo | Path | Owner command |",
+        "|---:|---|---|---|---|",
     ]
 
     for i, item in enumerate(owner_removal_candidates[:80], 1):
-        lines.append(f"| {i} | {item['name']} | {item['repo']} | {item['path']} |")
+        lines.append(
+            f"| {i} | {item['name']} | {item['repo']} | {item['path']} | "
+            f"`{item['owner_command']}` |"
+        )
 
     lines += [
         "",
