@@ -117,6 +117,7 @@ def main() -> int:
         "review_proof": {
             "review_clean_count": int(review_proof.get("review_clean_count", 0) or 0),
             "proven_count": int(review_proof.get("proven_count", 0) or 0),
+            "owner_removal_candidate_count": int(review_proof.get("owner_removal_candidate_count", 0) or 0),
             "counts": review_counts,
         },
         "boundary": "P2 automatic cleanup is complete; remaining groups are protected owner-review groups.",
@@ -160,6 +161,7 @@ def main() -> int:
         "",
         f"- Clean REVIEW items inspected: {review['review_clean_count']}",
         f"- Proven evidence candidates: {review['proven_count']}",
+        f"- Owner-removal evidence candidates: {review['owner_removal_candidate_count']}",
         f"- PATCH_EQUIVALENT_TO_MAIN: {review_counts_out.get('PATCH_EQUIVALENT_TO_MAIN', 0)}",
         f"- CLEAN_BUT_NOT_PROVEN: {review_counts_out.get('CLEAN_BUT_NOT_PROVEN', 0)}",
         "",
